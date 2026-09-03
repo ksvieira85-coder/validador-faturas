@@ -125,6 +125,15 @@ tbody tr:hover{background:var(--surface-2);}
   background:rgba(208,59,59,0.1); border:1px solid var(--critical); color:var(--critical);
   border-radius:8px; padding:10px 14px; font-size:13px; margin-top:10px;
 }
+.params-group{margin-bottom:16px;}
+.params-group:last-child{margin-bottom:0;}
+.params-group-title{font-size:12px; font-weight:700; text-transform:uppercase; letter-spacing:0.04em; color:var(--text-muted); margin-bottom:8px; padding-bottom:6px; border-bottom:1px solid var(--border);}
+.params-row{display:grid; grid-template-columns:1fr 140px; gap:12px; align-items:center; padding:6px 0;}
+.params-row label{font-size:13px;}
+.params-row .params-source{display:block; font-size:11px; color:var(--text-muted); margin-top:2px;}
+.params-row input{width:100%; padding:7px 9px; border:1px solid var(--border); border-radius:8px; background:var(--surface); color:var(--text); font-size:13px; text-align:right;}
+.params-row input.dirty{border-color:var(--info);}
+.params-note{font-size:12px; color:var(--text-muted); margin-bottom:14px; line-height:1.5;}
 </style>
 </head>
 <body>
@@ -142,6 +151,19 @@ tbody tr:hover{background:var(--surface-2);}
     <h2><span class="step">Passo 1 —</span> Escolha o fornecedor / tipo de fatura</h2>
     <select id="supplierSelect"></select>
     <div id="supplierDesc" class="status-line"></div>
+  </div>
+
+  <div class="card hidden" id="paramsCard">
+    <h2><span class="step">Passo 1.5 —</span> <span id="paramsTitle">Parâmetros</span></h2>
+    <div class="params-note">Estes valores ficam salvos neste navegador (não dependem de ninguém mexer no código) — qualquer pessoa que abrir esta página no mesmo computador/navegador pode ajustar. Use "Exportar" para levar os valores para outro computador ou compartilhar com o time, e "Importar" para carregar um arquivo exportado.</div>
+    <div id="paramsBody"></div>
+    <div class="section-actions">
+      <button class="secondary" id="paramsExportBtn">⬇ Exportar parâmetros (.json)</button>
+      <button class="secondary" id="paramsImportBtn">⬆ Importar parâmetros (.json)</button>
+      <input type="file" id="paramsImportFile" accept=".json" class="hidden">
+      <button class="secondary" id="paramsResetBtn">↺ Restaurar padrão</button>
+    </div>
+    <div class="status-line" id="paramsStatus"></div>
   </div>
 
   <div class="card" id="uploadCard">
@@ -2007,6 +2029,535 @@ https://github.com/nodeca/pako/blob/main/LICENSE
   }
 
   // ---------------------------------------------------------------------
+  // MÓDULO: FSL (Fretes CTE / Sell Out / Quiosques)
+  // ---------------------------------------------------------------------
+  // v1 — construído a partir das referências da skill `validacao-fatura-fsl`
+  // (tarifas.md, sellout.md, armadilhas.md, entregaveis.md) e do script
+  // fsl_lib.py da própria skill, que já traz o layout de colunas REAL da
+  // aba de fatura (confirmado numa validação anterior) — não é um chute:
+  //   CT-E, TIPO, DATA CT-E, DATA FRETE, PAGADOR, CNPJ PAGADOR, REMETENTE,
+  //   DESTINATÁRIO, NF, PESO, VOL, VALOR NF, FRETE TOTAL,
+  //   Classificação/Descrição, ALIQ %, Status, OBS/OBS.
+  // CIDADE e UF aparecem duas vezes (remetente e destinatário) — resolvidos
+  // por deslocamento a partir de REMETENTE/DESTINATÁRIO, nunca pelo nome
+  // (armadilhas.md item 2), com erro alto se o layout não bater.
+  //
+  // Duas limitações conhecidas desta primeira versão, sinalizadas em tela
+  // (não escondidas em fórmula):
+  //   1. A aba de Quiosques não teve seu layout confirmado numa fatura real
+  //      ainda — a leitura usa o mesmo detector genérico da aba de CTE, mas
+  //      pode não reconhecer todas as colunas. Envie um Relatório CTE real
+  //      (as 3 abas) para confirmarmos/ajustarmos.
+  //   2. A tabela de frete nova (vigência Q2 ago/2026) tem sub-categorias de
+  //      região (Interior / Grande porte / Interior 2 / Fluvial) que não
+  //      existiam na versão anterior, e não temos a lista de qual cidade cai
+  //      em qual categoria — só a capital é classificável com segurança. Para
+  //      as demais, o Sell Out fica marcado "requer classificação manual" em
+  //      vez de aplicar um palpite.
+  // ---------------------------------------------------------------------
+
+  const FSL_CNPJ_FILIAIS = {
+    "37334738000286": { nome: "BTC Comércio", cidade: "Serra", uf: "ES" },
+    "32124385000276": { nome: "Sallve SP", cidade: "Itapevi", uf: "SP" },
+    "32124385000357": { nome: "Sallve ES", cidade: "Serra", uf: "ES" },
+    "32124385000438": { nome: "Sallve RJ", cidade: "Rio de Janeiro", uf: "RJ" },
+  };
+  const FSL_CNPJ_RJ = "32124385000438";
+
+  const FSL_CAPITAIS = {
+    AC: "RIO BRANCO", AL: "MACEIO", AM: "MANAUS", AP: "MACAPA", BA: "SALVADOR",
+    CE: "FORTALEZA", DF: "BRASILIA", ES: "VITORIA", GO: "GOIANIA", MA: "SAO LUIS",
+    MG: "BELO HORIZONTE", MS: "CAMPO GRANDE", MT: "CUIABA", PA: "BELEM", PB: "JOAO PESSOA",
+    PE: "RECIFE", PI: "TERESINA", PR: "CURITIBA", RJ: "RIO DE JANEIRO", RN: "NATAL",
+    RO: "PORTO VELHO", RR: "BOA VISTA", RS: "PORTO ALEGRE", SC: "FLORIANOPOLIS",
+    SE: "ARACAJU", SP: "SAO PAULO", TO: "PALMAS",
+  };
+
+  function normalizeCnpj(v) {
+    const s = String(v === null || v === undefined ? "" : v).replace(/\D/g, "");
+    return s || null;
+  }
+
+  function ehSallveOuBtc(nome) {
+    const n = normalizeText(nome);
+    return n.includes("sallve") || n.includes("btc");
+  }
+
+  function eh4Elos(nome) {
+    return normalizeText(nome).includes("4 elos") || normalizeText(nome).includes("4elos");
+  }
+
+  // Declaração de conteúdo de abastecimento de quiosque (padrão DDMMAAAA,
+  // 8 ou 10 dígitos) — não é NF-e, não existe no SAP. armadilhas.md item 5.
+  function ehDeclaracaoConteudo(nf) {
+    const s = String(nf || "").replace(/\D/g, "");
+    if (!/^\d{8}$/.test(s) && !/^\d{10}$/.test(s)) return false;
+    const d = Number(s.slice(0, 2)), m = Number(s.slice(2, 4)), a = Number(s.slice(4, 8));
+    return d >= 1 && d <= 31 && m >= 1 && m <= 12 && a >= 2020 && a <= 2035;
+  }
+
+  const FSL_PARAMS_DEFAULT = {
+    storageKey: "fsl_params_v1",
+    label: "Parâmetros FSL — edite livremente, fica salvo neste navegador",
+    groups: [
+      {
+        title: "Quiosques — valor mensal acordado",
+        fields: [
+          { key: "quiosqueValorRJ", label: "Quiosques RJ (R$/mês)", default: 3770, source: "Passado por escrito (ago/2026)" },
+          { key: "quiosqueValorMG", label: "Quiosques MG (R$/mês)", default: 3770, source: "Passado por escrito (ago/2026)" },
+        ],
+      },
+      {
+        title: "Fretes CTE — % por grupo tarifário (sobre o valor da NF)",
+        fields: [
+          { key: "pctCrossDocking", label: "Cross-docking (por trecho)", default: 1.0, source: "tarifas.md" },
+          { key: "pctInbound", label: "Inbound", default: 1.5, source: "tarifas.md" },
+          { key: "pctOutbound", label: "Outbound", default: 1.3, source: "tarifas.md" },
+          { key: "pctTransferencia", label: "Transferência (fora do cross-docking)", default: 1.3, source: "tarifas.md" },
+          { key: "pctRJ", label: "Estado do RJ (CNPJ pagador RJ)", default: 1.8, source: "tarifas.md" },
+          { key: "pct4ElosRJ", label: "4 Elos — CNPJ pagador RJ (32.124.385/0004-38)", default: 1.3, source: "Passado por escrito (ago/2026)" },
+        ],
+      },
+      {
+        title: "Sell Out — taxas acessórias (tabela vigência Q2 ago/2026)",
+        fields: [
+          { key: "pedagioPorFracao100kg", label: "Pedágio (R$ por fração de 100kg)", default: 5.0, source: "Generalidades da tabela nova" },
+          { key: "grisMinimo", label: "Mínimo GRIS (R$/CT-e)", default: 6.0, source: "Generalidades da tabela nova (era R$5,00)" },
+          { key: "advMinimo", label: "Mínimo Advalorem (R$/CT-e) — NÃO CONFIRMADO", default: 0, source: "Não consta na tabela nova; era R$5,20 — confirmar" },
+          { key: "tasPorCte", label: "TAS - Taxa Adm. SEFAZ (R$/CT-e)", default: 3.5, source: "Generalidades da tabela nova" },
+          { key: "taxaDespachoPorCte", label: "Taxa de Despacho (R$/CT-e)", default: 10.0, source: "Generalidades da tabela nova" },
+          { key: "toleranciaArredondamento", label: "Tolerância de arredondamento (R$)", default: 1.0, source: "armadilhas.md item 10" },
+        ],
+      },
+      {
+        title: "Reentrega / Devolução",
+        fields: [
+          { key: "pctReentrega", label: "Reentrega (% do CT-e original)", default: 50, source: "Generalidades" },
+          { key: "minReentrega", label: "Mínimo reentrega (R$)", default: 65, source: "Generalidades da tabela nova" },
+        ],
+      },
+    ],
+  };
+
+  // ---- Leitura genérica de uma aba da fatura FSL (mesma lógica do
+  // fsl_lib.py: CIDADE/UF por deslocamento a partir de REMETENTE/
+  // DESTINATÁRIO, nunca pelo nome da coluna). `strict=true` (abas CTE/Sell
+  // Out, cujo layout já foi confirmado numa fatura real) lança erro alto se
+  // o layout não bater; `strict=false` (aba de Quiosques, layout ainda não
+  // confirmado) segue sem REM_CIDADE/REM_UF quando não encontra.
+  function parseFSLAba(ws, nomeAba, strict) {
+    const rows = sheetToRows(ws);
+    if (!rows.length) return { header: [], rows: [], idx: {} };
+    const header = rows[0].map((h) => (h === null || h === undefined ? "" : String(h).trim()));
+    const idx = indexMap(header);
+    const CAMPOS = ["CT-E", "TIPO", "DATA CT-E", "DATA FRETE", "PAGADOR", "CNPJ PAGADOR",
+      "REMETENTE", "DESTINATÁRIO", "NF", "PESO", "VOL", "VALOR NF", "FRETE TOTAL",
+      "Classificação/Descrição", "ALIQ %", "Status", "OBS", "OBS."];
+    const ix = {};
+    for (const nome of CAMPOS) if (nome in idx) ix[nome] = idx[nome];
+    for (const [base, pref] of [["REMETENTE", "REM"], ["DESTINATÁRIO", "DEST"]]) {
+      if (base in ix) {
+        const i = ix[base];
+        if (i + 2 < header.length && header[i + 1].toUpperCase().startsWith("CIDADE")) {
+          ix[pref + "_CIDADE"] = i + 1;
+          ix[pref + "_UF"] = i + 2;
+        } else if (strict) {
+          throw new Error(`Aba "${nomeAba}": esperava a coluna CIDADE logo depois de ${base}, encontrei "${header[i + 1]}" — confira se o layout da fatura mudou antes de confiar no resultado.`);
+        }
+      }
+    }
+    const out = [];
+    for (const r of rows.slice(1)) {
+      if (r[0] === null || r[0] === undefined || r[0] === "") continue;
+      const g = (campo) => (ix[campo] !== undefined ? r[ix[campo]] : null);
+      out.push({
+        _raw: r,
+        cte: g("CT-E"),
+        tipo: String(g("TIPO") || "").trim(),
+        dataCte: xl2date(g("DATA CT-E")),
+        dataFrete: xl2date(g("DATA FRETE")),
+        pagador: g("PAGADOR"),
+        cnpjPagador: normalizeCnpj(g("CNPJ PAGADOR")),
+        remetente: g("REMETENTE"),
+        remCidade: g("REM_CIDADE"),
+        remUf: g("REM_UF"),
+        destinatario: g("DESTINATÁRIO"),
+        destCidade: g("DEST_CIDADE"),
+        destUf: g("DEST_UF"),
+        nf: g("NF"),
+        peso: toNum(g("PESO"), 0),
+        vol: g("VOL"),
+        valorNF: toNum(g("VALOR NF"), 0),
+        freteTotal: toNum(g("FRETE TOTAL"), 0),
+        classificacaoDescricao: g("Classificação/Descrição"),
+        aliqPct: toNum(g("ALIQ %"), 0),
+        status: g("Status"),
+        obs: g("OBS") || g("OBS.") || null,
+      });
+    }
+    return { header, rows: out, idx: ix };
+  }
+
+  function findFSLSheet(wb, marcador) {
+    const name = wb.SheetNames.find((n) => normalizeText(n).includes(marcador));
+    return name ? wb.Sheets[name] : null;
+  }
+
+  // ---- Tabela de frete FSL (vigência Q2 ago/2026) — UF + Região (não é
+  // CEP como Diálogo/Loggi/Correios). Espera o formato gerado a partir do
+  // PDF: aba "Tabela FSL Fracionado" com cabeçalho UF/Região/8 faixas de
+  // peso/Frete Valor/Advalorem %/Prazo D+/Gris %/Seguro.
+  function loadFslFreightTable(file) {
+    return readWorkbook(file).then((wb) => {
+      const sheetName = wb.SheetNames.find((n) => normalizeText(n).includes("tabela fsl")) || wb.SheetNames[0];
+      const ws = wb.Sheets[sheetName];
+      const rows = sheetToRows(ws);
+      if (rows.length < 2) throw new Error('Tabela de frete FSL: aba vazia ou sem cabeçalho.');
+      const header = rows[0].map((h) => String(h || "").trim());
+      const idx = indexMap(header);
+      const need = ["UF", "Região", "Frete Valor (exc. R$/kg)", "Advalorem %", "Gris %"];
+      for (const n of need) if (!(n in idx)) throw new Error(`Tabela de frete FSL: coluna "${n}" não encontrada — confira se é o arquivo gerado a partir da tabela nova (vigência Q2 ago/2026).`);
+      const bracketCols = header.slice(2, 10); // "Até 10kg" ... "Até 200kg"
+      const bracketLimits = bracketCols.map((h) => Number(String(h).replace(/[^\d]/g, "")));
+      const map = new Map();
+      for (const r of rows.slice(1)) {
+        if (r[0] === null || r[0] === undefined || r[0] === "") continue;
+        const uf = String(r[0]).trim().toUpperCase();
+        const regiao = String(r[1]).trim();
+        const brackets = r.slice(2, 10).map((v) => toNum(v, 0));
+        const entry = {
+          uf, regiao,
+          brackets, bracketLimits,
+          freteExc: toNum(r[idx["Frete Valor (exc. R$/kg)"]], 0),
+          advPct: toNum(r[idx["Advalorem %"]], 0),
+          prazoD: r[idx["Prazo D+"]],
+          grisPct: toNum(r[idx["Gris %"]], 0),
+          seguro: r[idx["Seguro"]],
+        };
+        map.set(`${uf}|${normalizeText(regiao)}`, entry);
+        // também indexa "<uf> capital" e "<uf> interior" normalizados para
+        // facilitar o lookup por classificação automática (só Capital tem
+        // regra de detecção confiável nesta versão — ver função abaixo).
+      }
+      return map;
+    });
+  }
+
+  // Só resolve a região com segurança quando é a capital do estado — as
+  // demais categorias (Interior / Grande porte / Interior 2 / Fluvial) não
+  // têm um mapa de cidade->categoria disponível. Ver nota no topo do módulo.
+  function resolverLinhaTabelaFSL(tabela, uf, cidade) {
+    if (!uf) return { entry: null, motivo: "UF do destinatário ausente na fatura." };
+    const ufU = String(uf).trim().toUpperCase();
+    const capital = FSL_CAPITAIS[ufU];
+    if (capital && normalizeText(cidade) === normalizeText(capital)) {
+      const entry = tabela.get(`${ufU}|${normalizeText("C-Capital")}`) || tabela.get(`${ufU}|${normalizeText("Capital")}`);
+      if (entry) return { entry, motivo: null };
+      return { entry: null, motivo: `Linha "${ufU} C-Capital" não encontrada na tabela de frete carregada.` };
+    }
+    return { entry: null, motivo: `Cidade "${cidade}" não é a capital de ${ufU} — a tabela nova tem sub-categorias (Interior/Grande/Interior 2/Fluvial) sem mapa de cidade->categoria disponível. Classifique manualmente.` };
+  }
+
+  function calcularSellOutEsperado(row, tabela, params) {
+    const { entry, motivo } = resolverLinhaTabelaFSL(tabela, row.destUf, row.destCidade);
+    if (!entry) return { esperado: null, motivo };
+    const peso = row.peso || 0;
+    let fretePeso;
+    const idxAcima = entry.bracketLimits.findIndex((lim) => peso <= lim + 1e-9);
+    if (idxAcima >= 0) {
+      fretePeso = entry.brackets[idxAcima];
+    } else {
+      fretePeso = peso * (entry.freteExc || 0); // acima da última faixa: peso TOTAL x excedente (sellout.md)
+    }
+    const pedagio = (params.pedagioPorFracao100kg || 0) * Math.ceil(peso / 100 || 0);
+    const adv = Math.max(params.advMinimo || 0, (row.valorNF || 0) * (entry.advPct / 100));
+    const gris = Math.max(params.grisMinimo || 0, (row.valorNF || 0) * (entry.grisPct / 100));
+    const taxasFixas = (params.tasPorCte || 0) + (params.taxaDespachoPorCte || 0);
+    const subtotal = fretePeso + pedagio + adv + gris + taxasFixas;
+    const aliq = (row.aliqPct || 0) / 100;
+    const total = aliq < 1 ? subtotal / (1 - aliq) : subtotal;
+    return {
+      esperado: round2(total),
+      motivo: null,
+      detalhe: { fretePeso: round2(fretePeso), pedagio: round2(pedagio), adv: round2(adv), gris: round2(gris), taxasFixas: round2(taxasFixas), subtotal: round2(subtotal) },
+    };
+  }
+
+  // ---- Classificação do grupo tarifário (aba CTE) — ver tarifas.md ----
+  function classificarCTE(row, params) {
+    const tipoN = normalizeText(row.tipo);
+    if (tipoN.includes("reentreg")) {
+      return { grupo: "Reentrega", pctEsperado: null, valorEsperado: null, observacao: "50% do CT-e original (Generalidades) — confira se o CT-e original consta do relatório." };
+    }
+    if (tipoN.includes("devol")) {
+      return { grupo: "Devolução", pctEsperado: null, valorEsperado: null, observacao: "Vazio contratual — tabela FSL diz 100% da tabela vigente, mas o acordo Sallve é por %, sem percentual definido para devolução. Não contestar sem antes definir o critério com a FSL." };
+    }
+    if (tipoN.includes("complement")) {
+      return { grupo: "Complementar", pctEsperado: null, valorEsperado: null, observacao: "Sem % automático — exigir memória de cálculo e aprovação prévia da Sallve; ônus da comprovação é da FSL." };
+    }
+
+    const remSallveBtc = ehSallveOuBtc(row.remetente);
+    const destSallveBtc = ehSallveOuBtc(row.destinatario);
+    let grupo, pctBase;
+    if (!remSallveBtc && destSallveBtc) {
+      if (normalizeText(row.destinatario).includes("btc")) {
+        grupo = "Cross-docking (fábrica × BTC)"; pctBase = params.pctCrossDocking;
+      } else {
+        grupo = "Inbound"; pctBase = params.pctInbound;
+      }
+    } else if (remSallveBtc && !destSallveBtc) {
+      grupo = "Outbound"; pctBase = params.pctOutbound;
+    } else if (remSallveBtc && destSallveBtc) {
+      if (normalizeText(row.remetente).includes("btc") && String(row.destUf || "").toUpperCase() === "SP") {
+        grupo = "Cross-docking (BTC × filial SP)"; pctBase = params.pctCrossDocking;
+      } else {
+        grupo = "Transferência"; pctBase = params.pctTransferencia;
+      }
+    } else {
+      return { grupo: "Indeterminado", pctEsperado: null, valorEsperado: null, observacao: `Nem remetente ("${row.remetente}") nem destinatário ("${row.destinatario}") identificados como Sallve/BTC — confira este CT-e manualmente (armadilhas.md).` };
+    }
+
+    let pct = pctBase;
+    let observacao = "";
+    if (row.cnpjPagador === FSL_CNPJ_RJ) {
+      if (eh4Elos(row.remetente) || eh4Elos(row.destinatario)) {
+        pct = params.pct4ElosRJ;
+        observacao = "Regra específica: CNPJ pagador RJ + nota da 4 Elos → % fixo, substitui o grupo tarifário padrão.";
+      } else {
+        pct = params.pctRJ;
+        observacao = "CNPJ pagador é a filial RJ → % do estado do RJ se sobrepõe ao grupo tarifário padrão (regra adotada: por CNPJ pagador, não por UF de origem/destino — confirmar se ainda vale).";
+      }
+    }
+    const valorEsperado = round2((row.valorNF || 0) * (pct / 100));
+    return { grupo, pctEsperado: pct, valorEsperado, observacao };
+  }
+
+  function fmtNum(v) { return v === null || v === undefined ? "" : v; }
+
+  const FSL = {
+    id: "fsl",
+    label: "FSL (Fretes CTE / Sell Out / Quiosques)",
+    description:
+      "Valida o relatório mensal da FSL — Fretes CTE (% por grupo tarifário), Sell Out (recálculo pela tabela de frete fracionado) e Quiosques (valor mensal fechado por estado) — e cruza com a base SAP quando enviada. v1: veja os avisos em tela sobre a aba de Quiosques (layout ainda não confirmado numa fatura real) e sobre a classificação de região do Sell Out (só capital é automática nesta tabela nova).",
+    params: FSL_PARAMS_DEFAULT,
+    inputs: [
+      {
+        key: "fatura",
+        label: "Relatório FSL (fatura)",
+        accept: ".xlsx,.xls",
+        multiple: false,
+        required: true,
+        desc: "Arquivo enviado pela FSL, com as abas de CTE, Sell Out e Quiosques (nomes reconhecidos automaticamente por conterem 'CTE', 'SellOut'/'Sell Out' e 'Quiosque').",
+      },
+      {
+        key: "tabelaFrete",
+        label: "Tabela de frete FSL (fracionado)",
+        accept: ".xlsx,.xls",
+        multiple: false,
+        required: true,
+        desc: "Planilha com a tabela de frete por UF/Região (aba 'Tabela FSL Fracionado') — mesmo formato do arquivo gerado a partir do PDF da FSL.",
+      },
+      {
+        key: "sapSaida",
+        label: "Base SAP — saída (uma por filial)",
+        accept: ".xls,.xlsx",
+        multiple: true,
+        required: false,
+        desc: "Opcional. Coluna 'Serial do Documento' — usada para conferir se as NFs de Outbound/Transferência existem no SAP.",
+      },
+      {
+        key: "sapEntrada",
+        label: "Base SAP — entrada (uma por filial)",
+        accept: ".xls,.xlsx",
+        multiple: true,
+        required: false,
+        desc: "Opcional. Coluna 'Serial' + 'Modelo' (só modelo 55 = NF-e) — usada para conferir as NFs de Inbound.",
+      },
+    ],
+
+    async validate(files) {
+      const warnings = [];
+      const notes = [];
+      const params = currentParams();
+
+      const wbFatura = await readWorkbook(files.fatura[0]);
+      const wsCte = findFSLSheet(wbFatura, "cte");
+      const wsSellOut = findFSLSheet(wbFatura, "sellout") || findFSLSheet(wbFatura, "sell out");
+      const wsQuiosque = findFSLSheet(wbFatura, "quiosque");
+      if (!wsCte && !wsSellOut && !wsQuiosque) {
+        throw new Error(`Não reconheci nenhuma aba de CTE/SellOut/Quiosque no arquivo enviado. Abas encontradas: ${wbFatura.SheetNames.join(", ")}. Confirme se é o Relatório FSL original (sem renomear abas).`);
+      }
+
+      const tabelaFrete = await loadFslFreightTable(files.tabelaFrete[0]);
+
+      // ---- SAP (opcional) ----
+      const hasSapSaida = !!(files.sapSaida && files.sapSaida.length);
+      const hasSapEntrada = !!(files.sapEntrada && files.sapEntrada.length);
+      const sapSaidaSerials = new Set();
+      const sapEntradaSerials = new Set();
+      if (hasSapSaida) {
+        for (const f of files.sapSaida) {
+          const wb = await readWorkbook(f);
+          const ws = pickSheet(wb, ["Sheet"]);
+          const rows = sheetToRows(ws);
+          if (!rows.length) continue;
+          const idx = indexMap(rows[0]);
+          if (!("Serial do Documento" in idx)) { warnings.push(`Base SAP saída "${f.name}": coluna 'Serial do Documento' não encontrada — ignorada.`); continue; }
+          for (const r of rows.slice(1)) {
+            const s = normalizeCnpj(r[idx["Serial do Documento"]]) ? String(Math.trunc(Number(r[idx["Serial do Documento"]]) || 0)) : null;
+            const raw = r[idx["Serial do Documento"]];
+            if (raw === null || raw === undefined || raw === "") continue;
+            sapSaidaSerials.add(String(Math.trunc(Number(raw))));
+          }
+        }
+      } else {
+        warnings.push("Base SAP de saída não enviada — o cruzamento documental de Outbound/Transferência não foi feito.");
+      }
+      if (hasSapEntrada) {
+        for (const f of files.sapEntrada) {
+          const wb = await readWorkbook(f);
+          const ws = pickSheet(wb, ["Sheet"]);
+          const rows = sheetToRows(ws);
+          if (!rows.length) continue;
+          const idx = indexMap(rows[0]);
+          if (!("Serial" in idx)) { warnings.push(`Base SAP entrada "${f.name}": coluna 'Serial' não encontrada — ignorada.`); continue; }
+          const modeloIdx = idx["Modelo"];
+          let modelo55Count = 0, total = 0;
+          for (const r of rows.slice(1)) {
+            total++;
+            if (modeloIdx !== undefined && String(r[modeloIdx] || "").trim() !== "55") continue;
+            modelo55Count++;
+            const raw = r[idx["Serial"]];
+            if (raw === null || raw === undefined || raw === "") continue;
+            sapEntradaSerials.add(String(Math.trunc(Number(raw))));
+          }
+          if (total > 0 && modelo55Count === 0) {
+            warnings.push(`Base SAP entrada "${f.name}": nenhum registro de modelo 55 (NF-e) — provável reextração errada no TaxPlus (só CT-e). Não conte as NFs desta filial como "não lançadas" (armadilhas.md item 11).`);
+          }
+        }
+      } else {
+        warnings.push("Base SAP de entrada não enviada — o cruzamento documental de Inbound não foi feito.");
+      }
+
+      // ---- CTE ----
+      const cteRows = [];
+      if (wsCte) {
+        const { rows } = parseFSLAba(wsCte, "CTE", true);
+        for (const row of rows) {
+          const cls = classificarCTE(row, params);
+          const desvio = cls.valorEsperado !== null ? round2(row.freteTotal - cls.valorEsperado) : null;
+          let situacao;
+          if (cls.valorEsperado === null) situacao = "AVALIAR";
+          else situacao = Math.abs(desvio) <= 0.02 * cls.valorEsperado + 0.5 ? "OK" : (desvio > 0 ? "ACIMA" : "ABAIXO");
+          let statusSap = null;
+          if (cls.grupo === "Outbound" || cls.grupo.startsWith("Transferência") || cls.grupo.startsWith("Cross-docking")) {
+            statusSap = hasSapSaida ? (row.nf && sapSaidaSerials.has(String(Math.trunc(Number(row.nf) || 0))) ? "OK" : "NAO_LOCALIZADA") : "SEM_BASE";
+          } else if (cls.grupo === "Inbound") {
+            statusSap = hasSapEntrada ? (row.nf && sapEntradaSerials.has(String(Math.trunc(Number(row.nf) || 0))) ? "OK" : "NAO_LANCADA") : "SEM_BASE";
+          }
+          cteRows.push({
+            "CT-E": row.cte, Tipo: row.tipo, DataFrete: row.dataFrete,
+            Remetente: row.remetente, Destinatario: row.destinatario, DestUF: row.destUf,
+            CNPJPagador: row.cnpjPagador, ValorNF: round2(row.valorNF), FreteCobrado: round2(row.freteTotal),
+            GrupoTarifario: cls.grupo, PctEsperado: cls.pctEsperado, ValorEsperado: cls.valorEsperado,
+            Desvio: desvio, Situacao: situacao, StatusSAP: statusSap, Observacao: cls.observacao || "",
+          });
+        }
+      } else {
+        warnings.push("Aba de CTE (Fretes) não encontrada no relatório enviado.");
+      }
+
+      // ---- Sell Out ----
+      const selloutRows = [];
+      if (wsSellOut) {
+        const { rows } = parseFSLAba(wsSellOut, "Sell Out", false);
+        for (const row of rows) {
+          const calc = calcularSellOutEsperado(row, tabelaFrete, params);
+          const desvio = calc.esperado !== null ? round2(row.freteTotal - calc.esperado) : null;
+          const tol = params.toleranciaArredondamento || 1;
+          let situacao;
+          if (calc.esperado === null) situacao = "REVISAR MANUALMENTE";
+          else situacao = Math.abs(desvio) <= tol ? "OK" : (desvio > 0 ? "ACIMA" : "ABAIXO");
+          selloutRows.push({
+            "CT-E": row.cte, DataFrete: row.dataFrete, DestCidade: row.destCidade, DestUF: row.destUf,
+            Peso: row.peso, ValorNF: round2(row.valorNF), AliqICMS: row.aliqPct,
+            FreteCobrado: round2(row.freteTotal), FreteEsperado: calc.esperado, Desvio: desvio,
+            Situacao: situacao, Observacao: calc.motivo || "",
+          });
+        }
+      } else {
+        warnings.push("Aba de Sell Out não encontrada no relatório enviado.");
+      }
+
+      // ---- Quiosques ----
+      const quiosqueRows = [];
+      const quiosqueTotais = {};
+      if (wsQuiosque) {
+        const { rows } = parseFSLAba(wsQuiosque, "Quiosques", false);
+        for (const row of rows) {
+          const isDC = ehDeclaracaoConteudo(row.nf) || ehDeclaracaoConteudo(row.cte);
+          const uf = String(row.destUf || row.remUf || "").toUpperCase() || "?";
+          const isLancamento = normalizeText(row.tipo).includes("lancamento") || normalizeText(row.classificacaoDescricao || "").includes("lancamento") || normalizeText(row.obs || "").includes("lancamento");
+          const valorConsiderado = row.freteTotal || 0;
+          quiosqueTotais[uf] = (quiosqueTotais[uf] || 0) + valorConsiderado;
+          quiosqueRows.push({
+            "CT-E/DC": row.cte || row.nf, UF: uf, Tipo: isLancamento ? "Lançamento (2x)" : "Padrão",
+            EhDeclaracaoConteudo: isDC ? "sim" : "não", ValorCobrado: round2(valorConsiderado),
+          });
+        }
+      } else {
+        warnings.push("Aba de Quiosques não encontrada no relatório enviado.");
+      }
+      const quiosqueEsperadoPorUf = { RJ: params.quiosqueValorRJ, MG: params.quiosqueValorMG };
+      const quiosqueResumoRows = Object.keys(quiosqueTotais).map((uf) => {
+        const esperado = quiosqueEsperadoPorUf[uf];
+        const cobrado = round2(quiosqueTotais[uf]);
+        const escopoNovo = esperado === undefined;
+        return {
+          UF: uf, TotalCobrado: cobrado, ValorAcordado: esperado !== undefined ? esperado : null,
+          Desvio: esperado !== undefined ? round2(cobrado - esperado) : null,
+          Situacao: escopoNovo ? "ESCOPO NOVO — aprovar/negociar" : (Math.abs(cobrado - esperado) <= 1 ? "OK" : "DIVERGENTE"),
+        };
+      });
+
+      // ---- KPIs ----
+      const totalCteCobrado = sum(cteRows.map((r) => r.FreteCobrado));
+      const totalCteEsperado = sum(cteRows.filter((r) => r.ValorEsperado !== null).map((r) => r.ValorEsperado));
+      const cteOk = cteRows.filter((r) => r.Situacao === "OK").length;
+      const cteAcima = cteRows.filter((r) => r.Situacao === "ACIMA").length;
+      const totalSelloutCobrado = sum(selloutRows.map((r) => r.FreteCobrado));
+      const totalSelloutEsperado = sum(selloutRows.filter((r) => r.FreteEsperado !== null).map((r) => r.FreteEsperado));
+      const selloutRevisar = selloutRows.filter((r) => r.Situacao === "REVISAR MANUALMENTE").length;
+      const totalQuiosques = sum(Object.values(quiosqueTotais));
+
+      const kpis = [
+        { label: "Fretes CTE — total cobrado", value: fmtMoney(totalCteCobrado), tone: "neutral", desc: "Soma da coluna FreteCobrado da aba CTE - Análise.", group: "Fretes CTE" },
+        { label: "Fretes CTE — total esperado", value: fmtMoney(totalCteEsperado), tone: "neutral", desc: "Soma do valor esperado (só linhas classificáveis automaticamente).", group: "Fretes CTE" },
+        { label: "Fretes CTE — desvio", value: fmtMoney(totalCteCobrado - totalCteEsperado), tone: Math.abs(totalCteCobrado - totalCteEsperado) > 1 ? "warning" : "good", desc: "Cobrado − esperado, só das linhas classificáveis.", group: "Fretes CTE" },
+        { label: "CT-E dentro do % combinado", value: `${cteOk}/${cteRows.length}`, tone: cteAcima ? "warning" : "good", desc: "Quantidade de linhas cujo desvio ficou dentro da tolerância de 2%.", group: "Fretes CTE" },
+        { label: "Sell Out — total cobrado", value: fmtMoney(totalSelloutCobrado), tone: "neutral", desc: "Soma da coluna FreteCobrado da aba Sell Out - Análise.", group: "Sell Out" },
+        { label: "Sell Out — total esperado", value: fmtMoney(totalSelloutEsperado), tone: "neutral", desc: "Soma do frete recalculado pela tabela — só linhas classificáveis (capital).", group: "Sell Out" },
+        { label: "Sell Out — requer classificação manual", value: selloutRevisar, tone: selloutRevisar ? "warning" : "good", desc: "CT-e cujo destino não é a capital do estado — a tabela nova tem sub-categorias de interior sem mapa de cidade->categoria disponível.", group: "Sell Out" },
+        { label: "Quiosques — total cobrado", value: fmtMoney(totalQuiosques), tone: "neutral", desc: "Soma de todos os CT-e/DC de quiosque no relatório, por UF.", group: "Quiosques" },
+      ];
+
+      notes.push("Esta é a primeira versão do módulo FSL. Duas frentes precisam de uma fatura real para fechar: (1) a aba de Quiosques ainda não teve o layout de colunas confirmado; (2) o Sell Out só classifica automaticamente CT-e com destino na capital do estado — os demais aparecem como 'REVISAR MANUALMENTE'. Envie um Relatório CTE real (3 abas) para ajustarmos.");
+      if (params.advMinimo === 0) {
+        notes.push("O mínimo de Advalorem está zerado nos parâmetros porque a tabela nova não traz esse valor explicitamente (era R$5,20 na tabela anterior). Confirme com a FSL e ajuste no painel de Parâmetros se ainda valer.");
+      }
+
+      const tables = {
+        "CTE - Análise": { rows: cteRows, statusCols: { Situacao: (v) => (v === "OK" ? "ok" : v === "ACIMA" ? "bad" : v === "ABAIXO" ? "warn" : "neutral"), StatusSAP: (v) => (v === "OK" ? "ok" : v === "SEM_BASE" ? "neutral" : "bad") } },
+        "Sell Out - Análise": { rows: selloutRows, statusCols: { Situacao: (v) => (v === "OK" ? "ok" : v === "REVISAR MANUALMENTE" ? "warn" : "bad") } },
+        "Quiosques - Resumo por UF": { rows: quiosqueResumoRows, statusCols: { Situacao: (v) => (v === "OK" ? "ok" : v.startsWith("ESCOPO") ? "warn" : "bad") } },
+        "Quiosques - Análise": { rows: quiosqueRows, statusCols: {} },
+      };
+
+      return { kpis, tables, warnings, notes };
+    },
+  };
+
+  // ---------------------------------------------------------------------
   // Registro de fornecedores — para adicionar um novo tipo de fatura,
   // registre aqui um novo objeto no mesmo formato.
   // ---------------------------------------------------------------------
@@ -2014,6 +2565,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     transportadoras: TRANSPORTADORAS,
     unilog: UNILOG,
     correios: CORREIOS,
+    fsl: FSL,
   };
 
   // ---------------------------------------------------------------------
@@ -2035,6 +2587,14 @@ https://github.com/nodeca/pako/blob/main/LICENSE
   const exportBtn = document.getElementById("exportBtn");
   const resultsTable = document.getElementById("resultsTable");
   const themeToggle = document.getElementById("themeToggle");
+  const paramsCard = document.getElementById("paramsCard");
+  const paramsTitle = document.getElementById("paramsTitle");
+  const paramsBody = document.getElementById("paramsBody");
+  const paramsExportBtn = document.getElementById("paramsExportBtn");
+  const paramsImportBtn = document.getElementById("paramsImportBtn");
+  const paramsImportFile = document.getElementById("paramsImportFile");
+  const paramsResetBtn = document.getElementById("paramsResetBtn");
+  const paramsStatus = document.getElementById("paramsStatus");
 
   function initSupplierSelect() {
     for (const key of Object.keys(SUPPLIERS)) {
@@ -2052,10 +2612,152 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     state.filesBySlot = {};
     supplierDesc.textContent = state.supplier.description;
     renderUploadGrid();
+    renderParamsPanel();
     resultsCard.classList.add("hidden");
     errorBox.innerHTML = "";
     statusLine.textContent = "";
     updateRunEnabled();
+  }
+
+  // -----------------------------------------------------------------------
+  // Painel de parâmetros por fornecedor — genérico, qualquer módulo pode
+  // declarar `params: { storageKey, groups: [{ title, fields: [...] }] }`
+  // (ver FSL abaixo) para ganhar um painel editável aqui, sem precisar de UI
+  // própria. Fica salvo em localStorage (por navegador/computador) e pode
+  // ser exportado/importado como .json para levar para outro computador ou
+  // repassar para outra pessoa do time — assim o ajuste de um valor (ex.:
+  // reajuste do quiosque) não depende de mexer no código.
+  // -----------------------------------------------------------------------
+  function paramsDefaults(module) {
+    const out = {};
+    for (const g of module.params.groups) for (const f of g.fields) out[f.key] = f.default;
+    return out;
+  }
+
+  function loadParams(module) {
+    const defaults = paramsDefaults(module);
+    try {
+      const raw = localStorage.getItem(module.params.storageKey);
+      if (!raw) return defaults;
+      const saved = JSON.parse(raw);
+      return { ...defaults, ...saved };
+    } catch (e) {
+      return defaults;
+    }
+  }
+
+  function saveParams(module, values) {
+    try {
+      localStorage.setItem(module.params.storageKey, JSON.stringify(values));
+    } catch (e) {
+      // localStorage indisponível (modo privado, política do navegador, etc.)
+      // — os campos continuam funcionando na sessão atual via `values` em
+      // memória, só não persistem entre recarregamentos.
+    }
+  }
+
+  function renderParamsPanel() {
+    const module = state.supplier;
+    if (!module.params) {
+      paramsCard.classList.add("hidden");
+      return;
+    }
+    paramsCard.classList.remove("hidden");
+    paramsTitle.textContent = module.params.label || `Parâmetros — ${module.label}`;
+    const values = loadParams(module);
+    paramsBody.innerHTML = "";
+    for (const group of module.params.groups) {
+      const groupEl = document.createElement("div");
+      groupEl.className = "params-group";
+      const titleEl = document.createElement("div");
+      titleEl.className = "params-group-title";
+      titleEl.textContent = group.title;
+      groupEl.appendChild(titleEl);
+      for (const field of group.fields) {
+        const row = document.createElement("div");
+        row.className = "params-row";
+        const labelWrap = document.createElement("label");
+        labelWrap.textContent = field.label;
+        if (field.source) {
+          const src = document.createElement("span");
+          src.className = "params-source";
+          src.textContent = field.source;
+          labelWrap.appendChild(src);
+        }
+        const input = document.createElement("input");
+        input.type = "number";
+        input.step = "any";
+        input.value = values[field.key];
+        input.dataset.key = field.key;
+        if (values[field.key] !== field.default) input.classList.add("dirty");
+        input.addEventListener("change", () => {
+          const v = input.value === "" ? null : Number(input.value);
+          values[field.key] = Number.isFinite(v) ? v : field.default;
+          input.value = values[field.key];
+          input.classList.toggle("dirty", values[field.key] !== field.default);
+          saveParams(module, values);
+          paramsStatus.textContent = "Salvo neste navegador.";
+        });
+        row.appendChild(labelWrap);
+        row.appendChild(input);
+        groupEl.appendChild(row);
+      }
+      paramsBody.appendChild(groupEl);
+    }
+  }
+
+  function currentParams() {
+    return loadParams(state.supplier);
+  }
+
+  function downloadTextFile(filename, text, mime) {
+    const blob = new Blob([text], { type: mime || "application/octet-stream" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  function initParamsPanelEvents() {
+    paramsExportBtn.addEventListener("click", () => {
+      const module = state.supplier;
+      if (!module.params) return;
+      const values = loadParams(module);
+      const payload = { fornecedor: module.id, exportadoEm: new Date().toISOString(), valores: values };
+      downloadTextFile(`parametros_${module.id}.json`, JSON.stringify(payload, null, 2), "application/json");
+      paramsStatus.textContent = "Parâmetros exportados.";
+    });
+    paramsImportBtn.addEventListener("click", () => paramsImportFile.click());
+    paramsImportFile.addEventListener("change", async (e) => {
+      const file = (e.target.files || [])[0];
+      if (!file) return;
+      try {
+        const text = await file.text();
+        const parsed = JSON.parse(text);
+        const values = parsed && parsed.valores ? parsed.valores : parsed;
+        const module = state.supplier;
+        if (!module.params) return;
+        const merged = { ...paramsDefaults(module), ...values };
+        saveParams(module, merged);
+        renderParamsPanel();
+        paramsStatus.textContent = `Parâmetros importados de "${file.name}".`;
+      } catch (err) {
+        paramsStatus.textContent = `Erro ao importar: ${err.message || err}`;
+      } finally {
+        paramsImportFile.value = "";
+      }
+    });
+    paramsResetBtn.addEventListener("click", () => {
+      const module = state.supplier;
+      if (!module.params) return;
+      saveParams(module, paramsDefaults(module));
+      renderParamsPanel();
+      paramsStatus.textContent = "Parâmetros restaurados para o padrão.";
+    });
   }
 
   function renderUploadGrid() {
@@ -2370,10 +3072,12 @@ https://github.com/nodeca/pako/blob/main/LICENSE
   exportBtn.addEventListener("click", exportResults);
   searchBox.addEventListener("input", () => { if (state.activeTab) paintRows(state.activeTab, searchBox.value); });
 
+  initParamsPanelEvents();
   initSupplierSelect();
   initTheme();
 
   // Exposed for QA/debugging only (no data leaves the browser).
   window.__appState = state;
 })();
+
 </script>
