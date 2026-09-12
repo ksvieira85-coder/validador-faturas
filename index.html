@@ -322,6 +322,50 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     return idx;
   }
 
+  // Acha, em QUALQUER aba do workbook e em qualquer uma das primeiras linhas
+  // (até maxLinhasCabecalho), a linha de cabeçalho que contém uma das
+  // colunas procuradas — bases externas (ex.: exportações do SAP) às vezes
+  // trazem título/filtros do relatório acima do cabeçalho de verdade, ou o
+  // cabeçalho não está na primeira aba. Sem isso, pickSheet(wb, ["Sheet"]) +
+  // indexMap(rows[0]) falha silenciosamente sempre que o layout da
+  // exportação varia (Kate, 03/09/2026: NF 11473 existia na base de saída
+  // real, coluna "Serial", mas o validador não achou).
+  function localizarTabelaComColuna(wb, candidatosColuna, maxLinhasCabecalho) {
+    maxLinhasCabecalho = maxLinhasCabecalho || 15;
+    for (const sheetName of wb.SheetNames) {
+      const rows = sheetToRows(wb.Sheets[sheetName]);
+      const limite = Math.min(maxLinhasCabecalho, rows.length);
+      for (let r = 0; r < limite; r++) {
+        const idx = indexMap(rows[r]);
+        const colIdx = findColumnIdx(idx, candidatosColuna);
+        if (colIdx !== undefined) {
+          return { sheetName, headerRowIdx: r, idx, dataRows: rows.slice(r + 1), colIdx };
+        }
+      }
+    }
+    return null;
+  }
+
+  // Variante de localizarTabelaComColuna para quando é preciso achar VÁRIAS
+  // colunas na MESMA linha de cabeçalho (ex.: pedido + custo do frete) —
+  // usa a primeira linha, de qualquer aba, que tenha pelo menos uma coluna
+  // batendo em cada grupo de candidatos passado.
+  function localizarTabelaComColunas(wb, gruposDeCandidatos, maxLinhasCabecalho) {
+    maxLinhasCabecalho = maxLinhasCabecalho || 15;
+    for (const sheetName of wb.SheetNames) {
+      const rows = sheetToRows(wb.Sheets[sheetName]);
+      const limite = Math.min(maxLinhasCabecalho, rows.length);
+      for (let r = 0; r < limite; r++) {
+        const idx = indexMap(rows[r]);
+        const cols = gruposDeCandidatos.map((cands) => findColumnIdx(idx, cands));
+        if (cols.every((c) => c !== undefined)) {
+          return { sheetName, headerRowIdx: r, idx, dataRows: rows.slice(r + 1), cols };
+        }
+      }
+    }
+    return null;
+  }
+
   // Acha a coluna certa mesmo quando o nome exato no arquivo do usuário varia
   // (acentuação, maiúsculas, sinônimo) — tenta match exato primeiro, depois
   // normalizado (sem acento, minúsculo). Usado por bases externas cujo layout
@@ -378,18 +422,18 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     const NF_CANDIDATES = ["Nota Fiscal", "NotaFiscal", "NF", "Número da Nota Fiscal", "Nr Nota Fiscal", "Número NF"];
     for (const f of files || []) {
       const wb = await readWorkbook(f);
-      const ws = pickSheet(wb, ["Sheet"]);
-      const rows = sheetToRows(ws);
-      if (!rows.length) continue;
-      const idx = indexMap(rows[0]);
-      const pedidoIdx = findColumnIdx(idx, PEDIDO_CANDIDATES);
-      const freteIdx = findColumnIdx(idx, FRETE_CANDIDATES);
-      const nfIdx = findColumnIdx(idx, NF_CANDIDATES);
-      if (pedidoIdx === undefined || freteIdx === undefined) {
-        warnings.push(`Arquivo "${f.name}" da base de pedidos de entrega não tem colunas reconhecíveis de número do pedido e/ou custo do frete — ignorado. Renomeie a coluna de pedido para algo como "Numero do Pedido" e a de frete para algo como "Custo Frete", ou avise para ajustarmos o reconhecimento.`);
+      // Procura pedido+frete na mesma linha em qualquer aba/primeiras linhas
+      // (não só a aba "Sheet"/linha 1) — mesmo ajuste feito nas bases SAP
+      // (Kate, 03/09/2026) para exportações reais com título acima do
+      // cabeçalho ou em aba com outro nome.
+      const achado = localizarTabelaComColunas(wb, [PEDIDO_CANDIDATES, FRETE_CANDIDATES]);
+      if (!achado) {
+        warnings.push(`Arquivo "${f.name}" da base de pedidos de entrega não tem colunas reconhecíveis de número do pedido e/ou custo do frete (procurei em todas as abas, nas primeiras 15 linhas de cada uma) — ignorado. Renomeie a coluna de pedido para algo como "Numero do Pedido" e a de frete para algo como "Custo Frete", ou avise para ajustarmos o reconhecimento.`);
         continue;
       }
-      for (const row of rows.slice(1)) {
+      const [pedidoIdx, freteIdx] = achado.cols;
+      const nfIdx = findColumnIdx(achado.idx, NF_CANDIDATES);
+      for (const row of achado.dataRows) {
         const pedidoRaw = row[pedidoIdx];
         const key = normalizePedidoKey(pedidoRaw);
         const custoFreteEntrega = toNum(row[freteIdx], null);
@@ -724,33 +768,44 @@ https://github.com/nodeca/pako/blob/main/LICENSE
 
         // ---- Base SAP (um ou mais arquivos) — opcional: sem ela, pula o
         // cruzamento documental e faz só o cruzamento de custo (tabela de frete).
-        const hasSap = !!(files.sap && files.sap.length > 0);
+        let hasSap = !!(files.sap && files.sap.length > 0);
         const sapSerials = new Map();
         let SAP_MIN = null, SAP_MAX = null;
         if (hasSap) {
           for (const f of files.sap) {
             const wb = await readWorkbook(f);
-            const ws = pickSheet(wb, ["Sheet"]);
-            const rows = sheetToRows(ws);
-            if (!rows.length) continue;
-            const header = rows[0];
-            const idx = indexMap(header);
-            if (!("Serial do Documento" in idx)) {
-              warnings.push(`Arquivo SAP "${f.name}" não tem a coluna 'Serial do Documento' — ignorado.`);
-              continue;
-            }
-            for (const row of rows.slice(1)) {
-              const raw = row[idx["Serial do Documento"]];
+            // Procura a coluna em QUALQUER aba e nas primeiras linhas de cada
+            // uma (não só a aba "Sheet" / linha 1 do arquivo) — exportações
+            // reais do SAP variam: às vezes vêm com linhas de título/filtro
+            // acima do cabeçalho, às vezes a coluna se chama só "Serial" em
+            // vez de "Serial do Documento" (Kate, 03/09/2026 — mesmo problema
+            // já visto e corrigido no módulo FSL).
+            const achado = localizarTabelaComColuna(wb, ["Serial do Documento", "Serial"]);
+            if (!achado) { warnings.push(`Arquivo SAP "${f.name}": não encontrei a coluna 'Serial do Documento' (nem 'Serial') em nenhuma aba (procurei nas primeiras 15 linhas de cada uma). Abas do arquivo: ${wb.SheetNames.join(", ")}. Arquivo ignorado.`); continue; }
+            const carrierIdx = findColumnIdx(achado.idx, ["CarrierName"]);
+            let carregados = 0;
+            for (const row of achado.dataRows) {
+              const raw = row[achado.colIdx];
               if (raw === null || raw === undefined || raw === "") continue;
               const serial = Math.trunc(Number(raw));
               if (Number.isNaN(serial)) continue;
-              sapSerials.set(serial, idx["CarrierName"] !== undefined ? row[idx["CarrierName"]] : null);
+              sapSerials.set(serial, carrierIdx !== undefined ? row[carrierIdx] : null);
+              carregados++;
             }
+            warnings.push(`Arquivo SAP "${f.name}": ${carregados} serial(is) carregado(s) da aba "${achado.sheetName}" (cabeçalho encontrado na linha ${achado.headerRowIdx + 1} do arquivo). (Aviso informativo, não é um erro.)`);
           }
-          if (sapSerials.size === 0) throw new Error("Nenhum registro válido encontrado nos arquivos de base SAP.");
-          const serialsArr = [...sapSerials.keys()];
-          SAP_MIN = Math.min(...serialsArr);
-          SAP_MAX = Math.max(...serialsArr);
+          if (sapSerials.size === 0) {
+            // Não trava a validação inteira por causa da base SAP (mesmo
+            // princípio já aplicado no módulo FSL): sem seriais lidos, o
+            // cruzamento documental fica pulado, mas o cruzamento de custo
+            // pela tabela de frete segue normalmente.
+            warnings.push('Nenhum registro válido foi lido dos arquivos de base SAP enviados (a coluna foi encontrada, mas nenhuma linha tinha um número válido) — o cruzamento documental (a nota existe no SAP?) ficou pulado, mas o restante da validação (frete cobrado vs. tabela) foi feito normalmente. Confira se é a exportação certa antes de considerar a fatura só pelo cruzamento de custo.');
+            hasSap = false;
+          } else {
+            const serialsArr = [...sapSerials.keys()];
+            SAP_MIN = Math.min(...serialsArr);
+            SAP_MAX = Math.max(...serialsArr);
+          }
         } else {
           warnings.push("Base SAP não enviada — o cruzamento documental (a nota existe no SAP?) não foi feito. Apenas o cruzamento de custo (frete cobrado vs. tabela) foi realizado.");
         }
@@ -1121,28 +1176,31 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     return { info, resumoRows, resumoTotals, detailSheets };
   }
 
+  // `keyField` pode ser um nome só ou uma lista de candidatos (as bases
+  // reais do SAP variam entre "Serial do Documento" e só "Serial" — Kate,
+  // 03/09/2026: "tem o Serial na coluna H na base de saída e na de
+  // entrada", ou seja, as duas usam o mesmo nome de coluna, não um por
+  // direção). Usa localizarTabelaComColuna (procura em qualquer aba e nas
+  // primeiras linhas de cada uma) em vez de travar na aba "Sheet"/linha 1.
   async function loadSapIndex(files, keyField, warnings) {
+    const candidatos = Array.isArray(keyField) ? keyField : [keyField, "Serial do Documento", "Serial"];
     const map = new Map();
     for (const f of files) {
       const wb = await readWorkbook(f);
-      const ws = pickSheet(wb, ["Sheet"]);
-      const rows = sheetToRows(ws);
-      if (!rows.length) continue;
-      const header = rows[0];
-      const idx = indexMap(header);
-      if (!(keyField in idx)) {
-        warnings.push(`Arquivo "${f.name}" não tem a coluna '${keyField}' — ignorado nesse cruzamento.`);
-        continue;
-      }
-      for (const row of rows.slice(1)) {
-        const raw = row[idx[keyField]];
+      const achado = localizarTabelaComColuna(wb, candidatos);
+      if (!achado) { warnings.push(`Arquivo "${f.name}": não encontrei nenhuma das colunas ${candidatos.map((c) => `'${c}'`).join("/")} em nenhuma aba (procurei nas primeiras 15 linhas de cada uma). Abas do arquivo: ${wb.SheetNames.join(", ")}. Ignorado nesse cruzamento.`); continue; }
+      let carregados = 0;
+      for (const row of achado.dataRows) {
+        const raw = row[achado.colIdx];
         if (raw === null || raw === undefined || raw === "") continue;
         const serial = Math.trunc(Number(raw));
         if (Number.isNaN(serial)) continue;
         const rec = {};
-        for (const k of Object.keys(idx)) rec[k] = row[idx[k]];
+        for (const k of Object.keys(achado.idx)) rec[k] = row[achado.idx[k]];
         map.set(String(serial), rec);
+        carregados++;
       }
+      warnings.push(`Arquivo "${f.name}": ${carregados} registro(s) carregado(s) da aba "${achado.sheetName}" (cabeçalho encontrado na linha ${achado.headerRowIdx + 1} do arquivo). (Aviso informativo, não é um erro.)`);
     }
     return map;
   }
@@ -2013,6 +2071,228 @@ https://github.com/nodeca/pako/blob/main/LICENSE
   }
 
   // ---------------------------------------------------------------------
+  // MÓDULO: Correios — Pedidos Sallve (Kate, 04/09/2026)
+  // ---------------------------------------------------------------------
+  // Diferente do módulo "Correios - Pedidos Unilog" acima (que cruza contra
+  // Intelipost/Reversas Shopify e calcula frete esperado por CD/CEP/peso),
+  // este cartão de postagem ("Pedidos Sallve") cobre especificamente envios
+  // EXCEDENTES — casos em que a FSL não conseguiu entregar e repassou o
+  // envio para os Correios, registrando isso no seu próprio relatório de
+  // "Fechamento Excedente". A validação pedida é mais simples: confirmar,
+  // pelo código de rastreio (ETIQUETA), que toda cobrança dos Correios nesse
+  // cartão corresponde a um excedente de fato declarado pela FSL.
+  //
+  // Armadilha real encontrada nos arquivos da Kate (04/09/2026): o relatório
+  // "Fechamento Excedente" da FSL (aba EXCEDENTES_NFS) não tem uma coluna
+  // própria de rastreio — o código vem embutido como texto livre dentro da
+  // coluna "CARD/SOLICITANTE/DESCRIÇÃO", só nas linhas que passaram pelos
+  // Correios (ex.: "Sol. Fernanda - Embalagem x Etiqueta (AD850594811BR)").
+  // Outras linhas dessa mesma coluna são entregas dedicadas sem rastreio
+  // nenhum ("DEDICADO/CONTRATO", "07 PALLETS", "Sol. Miriam - Offboarding
+  // ...") ou até um rastreio de OUTRA transportadora (ex.: "Envio fedex
+  // (875924762812)") — nenhuma delas é comparável a uma ETIQUETA dos
+  // Correios, então ficam de fora do cruzamento (não contam como divergência
+  // nem como confirmação).
+  //
+  // Regra confirmada com a Kate (04/09/2026): uma ETIQUETA cobrada na fatura
+  // dos Correios que NÃO aparece em nenhum excedente declarado pela FSL é
+  // tratada como cobrança indevida/a investigar (não como possível base
+  // incompleta) — por isso os Correios são a base "mestre" da conferência
+  // (percorremos cada linha da fatura, não o contrário).
+  const REGEX_ETIQUETA_CORREIOS = /([A-Z]{2}\d{9}BR)/i;
+  const FSL_EXCEDENTE_DESC_CANDIDATOS = [
+    "CARD/SOLICITANTE/DESCRIÇÃO", "CARD/SOLICITANTE/DESCRICAO",
+    "SOLICITANTE/DESCRIÇÃO", "SOLICITANTE/DESCRICAO", "DESCRIÇÃO", "DESCRICAO",
+  ];
+
+  // Lê o relatório de Fechamento Excedente da FSL e extrai, de cada linha, o
+  // código de rastreio dos Correios (quando houver) de dentro do texto livre
+  // da coluna solicitante/descrição. Devolve as linhas COM rastreio
+  // reconhecido (usadas no cruzamento) separadas das SEM rastreio
+  // reconhecido (mostradas à parte, só como referência).
+  async function parseFSLExcedentes(file) {
+    const wb = await readWorkbook(file);
+    const achado = localizarTabelaComColuna(wb, FSL_EXCEDENTE_DESC_CANDIDATOS);
+    if (!achado) {
+      throw new Error(`Fatura FSL Excedentes (${file.name}): não encontrei a coluna "CARD/SOLICITANTE/DESCRIÇÃO" (onde vem o código de rastreio) em nenhuma aba.`);
+    }
+    const { idx, dataRows } = achado;
+    const descIdx = findColumnIdx(idx, FSL_EXCEDENTE_DESC_CANDIDATOS);
+    const manifestoIdx = findColumnIdx(idx, ["MANIFESTO"]);
+    const nfeIdx = findColumnIdx(idx, ["NFe", "NF-e", "NF"]);
+    const dtFreteIdx = findColumnIdx(idx, ["DT FRETE", "DATA FRETE"]);
+    const destIdx = findColumnIdx(idx, ["DESTINATARIO", "DESTINATÁRIO"]);
+    const ufIdx = findColumnIdx(idx, ["UF"]);
+    const valorIdx = findColumnIdx(idx, ["VALOR TOTAL"]);
+
+    const comEtiqueta = [];
+    const semEtiqueta = [];
+    for (const r of dataRows) {
+      const descRaw = descIdx !== undefined ? r[descIdx] : null;
+      const desc = descRaw !== null && descRaw !== undefined ? String(descRaw).trim() : "";
+      if (!desc) continue;
+      const descNorm = normalizeText(desc);
+      // Pula rodapé (SUBTOTAL/TOTAL) e a linha de cabeçalho repetida no meio
+      // da aba (visto no arquivo real da Kate, linha 19 da EXCEDENTES_NFS).
+      if (["subtotal", "total"].includes(descNorm)) continue;
+      if (FSL_EXCEDENTE_DESC_CANDIDATOS.some((c) => normalizeText(c) === descNorm)) continue;
+
+      const item = {
+        manifesto: manifestoIdx !== undefined ? r[manifestoIdx] : null,
+        nfe: nfeIdx !== undefined ? r[nfeIdx] : null,
+        dtFrete: dtFreteIdx !== undefined ? xl2date(r[dtFreteIdx]) : null,
+        destinatario: destIdx !== undefined ? r[destIdx] : null,
+        uf: ufIdx !== undefined ? r[ufIdx] : null,
+        valorTotal: valorIdx !== undefined ? toNum(r[valorIdx], null) : null,
+        descricao: desc,
+      };
+      const m = desc.match(REGEX_ETIQUETA_CORREIOS);
+      if (m) {
+        item.etiqueta = m[1].toUpperCase();
+        comEtiqueta.push(item);
+      } else {
+        semEtiqueta.push(item);
+      }
+    }
+    return { comEtiqueta, semEtiqueta };
+  }
+
+  const CORREIOS_SALLVE = {
+    id: "correios_sallve",
+    label: "Correios - Pedidos Sallve",
+    description:
+      'Cruza a fatura dos Correios do cartão de postagem "Pedidos Sallve" com o relatório de Fechamento Excedente da FSL, pelo código de rastreio (ETIQUETA) — não pela NF. A FSL não tem uma coluna própria de rastreio nesse relatório: o código vem dentro do texto livre da coluna "CARD/SOLICITANTE/DESCRIÇÃO" (ex.: "Embalagem x Etiqueta (AD850594811BR)"). Toda linha da fatura dos Correios cujo rastreio NÃO é encontrado em nenhum excedente declarado pela FSL fica marcada como "NÃO ENCONTRADO" — cobrança sem excedente correspondente, a investigar. Linhas do relatório da FSL sem um rastreio reconhecível (entrega dedicada, ou rastreio de outra transportadora) ficam à parte, só como referência.',
+    inputs: [
+      {
+        key: "fatura",
+        label: "Fatura Correios (Extrato) — Pedidos Sallve",
+        accept: ".xlsx,.xls",
+        multiple: false,
+        required: true,
+        desc: "Extrato analítico da fatura dos Correios do cartão \"Pedidos Sallve\" (mesmo formato do extrato padrão — aba com cabeçalho 'CODIGO SERVICO' e coluna 'ETIQUETA').",
+      },
+      {
+        key: "excedentesFsl",
+        label: "Fechamento Excedente — FSL",
+        accept: ".xlsx,.xls",
+        multiple: true,
+        required: true,
+        desc: "Relatório de Fechamento Excedente da FSL (aba 'EXCEDENTES_NFS'). O rastreio dos Correios é extraído do texto da coluna 'CARD/SOLICITANTE/DESCRIÇÃO'. Pode enviar mais de um arquivo (ex.: mais de uma quinzena/período).",
+      },
+    ],
+
+    async validate(files) {
+      const warnings = [];
+      const { lines } = await parseCorreiosExtrato(files.fatura[0]);
+      if (!lines.length) throw new Error("Fatura Correios (extrato): nenhuma linha de serviço encontrada.");
+
+      const excedentesComEtiqueta = [];
+      const excedentesSemEtiqueta = [];
+      for (const f of files.excedentesFsl || []) {
+        const { comEtiqueta, semEtiqueta } = await parseFSLExcedentes(f);
+        excedentesComEtiqueta.push(...comEtiqueta);
+        excedentesSemEtiqueta.push(...semEtiqueta);
+      }
+      if (!excedentesComEtiqueta.length) {
+        warnings.push('Nenhum código de rastreio foi reconhecido no(s) relatório(s) de Fechamento Excedente da FSL enviado(s) — confira se a coluna "CARD/SOLICITANTE/DESCRIÇÃO" realmente traz o rastreio entre parênteses (ex.: "Embalagem x Etiqueta (AD850594811BR)"). Sem isso, todas as linhas da fatura dos Correios abaixo aparecem como "NÃO ENCONTRADO" — não necessariamente uma cobrança indevida de verdade.');
+      }
+
+      const excedentesPorEtiqueta = new Map();
+      for (const item of excedentesComEtiqueta) {
+        if (!excedentesPorEtiqueta.has(item.etiqueta)) excedentesPorEtiqueta.set(item.etiqueta, []);
+        excedentesPorEtiqueta.get(item.etiqueta).push(item);
+      }
+
+      const correiosEtiquetas = new Set();
+      const results = lines.map((l) => {
+        const etiqueta = l.etiqueta ? String(l.etiqueta).trim().toUpperCase() : null;
+        if (etiqueta) correiosEtiquetas.add(etiqueta);
+        const matches = etiqueta ? excedentesPorEtiqueta.get(etiqueta) : undefined;
+        const status = !etiqueta ? "SEM_ETIQUETA" : matches && matches.length ? "OK" : "NAO_ENCONTRADA";
+        const match = matches && matches[0];
+        return {
+          Etiqueta: etiqueta,
+          CodigoServico: l.codigoServico,
+          DescricaoServico: l.descricaoServico,
+          DataPostagem: l.dataPostagem,
+          CepDestinatario: l.cepDestinatario,
+          ValorCobradoCorreios: round2(l.valorLiquido),
+          StatusCruzamento: status,
+          ManifestoFSL: match ? match.manifesto : null,
+          NFeFSL: match ? match.nfe : null,
+          DestinatarioFSL: match ? match.destinatario : null,
+          ValorTotalFSL: match ? round2(match.valorTotal) : null,
+        };
+      });
+
+      const naoEncontrados = results.filter((r) => r.StatusCruzamento === "NAO_ENCONTRADA");
+      const semEtiquetaFatura = results.filter((r) => r.StatusCruzamento === "SEM_ETIQUETA");
+      const encontrados = results.filter((r) => r.StatusCruzamento === "OK");
+      const totalCobrado = sum(results.map((r) => r.ValorCobradoCorreios));
+      const totalNaoEncontrado = sum(naoEncontrados.map((r) => r.ValorCobradoCorreios));
+
+      // Excedentes da FSL com rastreio reconhecido que não aparecem cobrados
+      // na fatura dos Correios enviada — informativo (a Kate definiu a
+      // divergência só no sentido Correios -> FSL; isso aqui pode ser
+      // excedente de outro período/cartão, não é tratado como erro).
+      const excedentesNaoEncontradosNaFatura = [];
+      for (const [etq, items] of excedentesPorEtiqueta.entries()) {
+        if (!correiosEtiquetas.has(etq)) {
+          for (const it of items) {
+            excedentesNaoEncontradosNaFatura.push({
+              Etiqueta: etq, Manifesto: it.manifesto, NFe: it.nfe, DtFrete: it.dtFrete,
+              Destinatario: it.destinatario, UF: it.uf, ValorTotalFSL: round2(it.valorTotal), Descricao: it.descricao,
+            });
+          }
+        }
+      }
+
+      const kpis = [
+        { label: "Linhas na fatura Correios", value: results.length, tone: "neutral", desc: "Total de linhas de cobrança lidas no extrato analítico da fatura dos Correios (cartão Pedidos Sallve)." },
+        { label: "Rastreios confirmados no Excedente FSL", value: `${encontrados.length}/${results.length}`, tone: naoEncontrados.length === 0 ? "good" : "critical", desc: 'Linhas cuja ETIQUETA foi encontrada em algum excedente declarado no(s) relatório(s) de Fechamento Excedente da FSL enviado(s).' },
+        { label: "Total cobrado — confirmado", value: fmtMoney(sum(encontrados.map((r) => r.ValorCobradoCorreios))), tone: "good", desc: "Soma do VALOR LIQUIDO das linhas com rastreio confirmado no excedente da FSL." },
+        { label: "Total cobrado — NÃO encontrado", value: fmtMoney(totalNaoEncontrado), tone: naoEncontrados.length === 0 ? "good" : "critical", desc: 'Soma do VALOR LIQUIDO das linhas cujo rastreio não foi encontrado em nenhum excedente da FSL — cobrança sem excedente correspondente declarado, a investigar/contestar (regra confirmada com a Kate, 04/09/2026).' },
+        { label: "Linhas sem ETIQUETA na fatura", value: semEtiquetaFatura.length, tone: semEtiquetaFatura.length ? "warning" : "good", desc: "Linhas da fatura dos Correios sem código de rastreio preenchido — não entram no cruzamento (nem OK nem divergente)." },
+        { label: "Excedentes FSL sem rastreio reconhecido", value: excedentesSemEtiqueta.length, tone: "neutral", desc: 'Linhas do relatório de Fechamento Excedente que não têm um código de rastreio dos Correios reconhecível no texto (entrega dedicada, "07 PALLETS", rastreio de outra transportadora etc.) — não fazem parte deste cruzamento. Ver aba "Excedentes sem rastreio".' },
+        { label: "Excedentes FSL não encontrados na fatura", value: excedentesNaoEncontradosNaFatura.length, tone: "neutral", desc: "Excedentes da FSL com rastreio reconhecido que não aparecem cobrados nesta fatura dos Correios — pode ser de outro período/cartão; informativo, não tratado como divergência. Ver aba \"Excedentes não faturados\"." },
+      ];
+
+      const notes = [
+        'O código de rastreio dos excedentes da FSL não vem numa coluna própria — é extraído por texto da coluna "CARD/SOLICITANTE/DESCRIÇÃO" (padrão "...Etiqueta (XXNNNNNNNNNBR)"). Linhas sem esse padrão reconhecível (entrega dedicada, ou rastreio de outra transportadora) ficam de fora do cruzamento — ver aba "Excedentes sem rastreio".',
+        'Regra confirmada com a Kate (04/09/2026): uma ETIQUETA cobrada pelos Correios que não aparece em nenhum excedente declarado pela FSL é tratada como cobrança indevida/a investigar, não como base incompleta — a fatura dos Correios é a base "mestre" desta conferência.',
+      ];
+      if (semEtiquetaFatura.length > 0) {
+        warnings.push(`${semEtiquetaFatura.length} linha(s) da fatura dos Correios sem ETIQUETA preenchida — não entraram no cruzamento.`);
+      }
+
+      const tables = {
+        Detalhe: {
+          rows: results,
+          statusCols: { StatusCruzamento: mapCorreiosSallveCruzamentoBadge },
+        },
+        "Excedentes não faturados": {
+          rows: excedentesNaoEncontradosNaFatura,
+        },
+        "Excedentes sem rastreio": {
+          rows: excedentesSemEtiqueta.map((it) => ({
+            Manifesto: it.manifesto, NFe: it.nfe, DtFrete: it.dtFrete, Destinatario: it.destinatario,
+            UF: it.uf, ValorTotal: round2(it.valorTotal), Descricao: it.descricao,
+          })),
+        },
+      };
+
+      return { kpis, tables, warnings, notes };
+    },
+  };
+
+  function mapCorreiosSallveCruzamentoBadge(v) {
+    if (v === "OK") return "ok";
+    if (v === "NAO_ENCONTRADA") return "bad";
+    if (v === "SEM_ETIQUETA") return "warn";
+    return "neutral";
+  }
+
+  // ---------------------------------------------------------------------
   // Helpers numéricos
   // ---------------------------------------------------------------------
   // Uses toFixed (correctly-rounded decimal conversion of the true double value)
@@ -2078,6 +2358,32 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     return s || null;
   }
 
+  // Chave de casamento de NF contra o SAP — mesma lógica do normaliza_num()
+  // do fsl_lib.py: só dígitos, sem zero à esquerda (a FSL reporta sem eles,
+  // o SAP às vezes com). Nunca usar para CNPJ (ali o zero à esquerda importa).
+  function normalizeNFKey(v) {
+    if (v === null || v === undefined || v === "") return null;
+    const s = String(v).replace(/\D/g, "");
+    if (!s) return null;
+    const stripped = s.replace(/^0+/, "");
+    return stripped || "0";
+  }
+
+  // Uma célula de NF pode trazer mais de uma nota, ex. "201531, 201552"
+  // (visto na fatura real — quiosque abastecido com duas notas no mesmo
+  // CT-e). Sem isso, normalizeNFKey colava os dois números num só e a
+  // conferência com o SAP nunca batia. Mesmo padrão do expandir_nfs() do
+  // fsl_lib.py: separa por vírgula/ponto-e-vírgula/barra/quebra de linha.
+  function splitMultiValor(v) {
+    const s = String(v === null || v === undefined ? "" : v).trim();
+    if (!s) return [];
+    return s.split(/[,;/\n\r]+|\s{2,}/).map((p) => p.trim()).filter(Boolean);
+  }
+  // Para casar com o SAP (tira zero à esquerda).
+  function expandirNFs(v) {
+    return splitMultiValor(v).map((p) => normalizeNFKey(p)).filter(Boolean);
+  }
+
   function ehSallveOuBtc(nome) {
     const n = normalizeText(nome);
     return n.includes("sallve") || n.includes("btc");
@@ -2108,36 +2414,37 @@ https://github.com/nodeca/pako/blob/main/LICENSE
         ],
       },
       {
-        title: "Fretes CTE — % por grupo tarifário (sobre o valor da NF)",
+        title: "Exceção por CNPJ pagador — 4 Elos",
         fields: [
-          { key: "pctCrossDocking", label: "Cross-docking (por trecho)", default: 1.0, source: "tarifas.md" },
-          { key: "pctInbound", label: "Inbound", default: 1.5, source: "tarifas.md" },
-          { key: "pctOutbound", label: "Outbound", default: 1.3, source: "tarifas.md" },
-          { key: "pctTransferencia", label: "Transferência (fora do cross-docking)", default: 1.3, source: "tarifas.md" },
-          { key: "pctRJ", label: "Estado do RJ (CNPJ pagador RJ)", default: 1.8, source: "tarifas.md" },
-          { key: "pct4ElosRJ", label: "4 Elos — CNPJ pagador RJ (32.124.385/0004-38)", default: 1.3, source: "Passado por escrito (ago/2026)" },
+          { key: "pct4ElosRJ", label: "4 Elos — CNPJ pagador RJ (32.124.385/0004-38)", default: 1.3, source: "Passado por escrito (ago/2026) — % sobre o valor da NF, substitui o cálculo pela tabela de frete só para essas notas" },
         ],
       },
       {
-        title: "Sell Out — taxas acessórias (tabela vigência Q2 ago/2026)",
+        title: "Ajustes do validador (não vêm da FSL)",
         fields: [
-          { key: "pedagioPorFracao100kg", label: "Pedágio (R$ por fração de 100kg)", default: 5.0, source: "Generalidades da tabela nova" },
-          { key: "grisMinimo", label: "Mínimo GRIS (R$/CT-e)", default: 6.0, source: "Generalidades da tabela nova (era R$5,00)" },
-          { key: "advMinimo", label: "Mínimo Advalorem (R$/CT-e) — NÃO CONFIRMADO", default: 0, source: "Não consta na tabela nova; era R$5,20 — confirmar" },
-          { key: "tasPorCte", label: "TAS - Taxa Adm. SEFAZ (R$/CT-e)", default: 3.5, source: "Generalidades da tabela nova" },
-          { key: "taxaDespachoPorCte", label: "Taxa de Despacho (R$/CT-e)", default: 10.0, source: "Generalidades da tabela nova" },
-          { key: "toleranciaArredondamento", label: "Tolerância de arredondamento (R$)", default: 1.0, source: "armadilhas.md item 10" },
-        ],
-      },
-      {
-        title: "Reentrega / Devolução",
-        fields: [
-          { key: "pctReentrega", label: "Reentrega (% do CT-e original)", default: 50, source: "Generalidades" },
-          { key: "minReentrega", label: "Mínimo reentrega (R$)", default: 65, source: "Generalidades da tabela nova" },
+          { key: "advMinimo", label: "Mínimo Advalorem (R$/CT-e) — NÃO CONFIRMADO", default: 0, source: "Não consta na tabela nova; era R$5,20 — confirmar com a FSL" },
+          { key: "toleranciaArredondamento", label: "Tolerância de arredondamento (R$)", default: 0.5, source: "Critério interno — armadilhas.md item 10 (reduzida de R$1,00 para R$0,50 a pedido da Kate, 10/09/2026: \"a FSL não tem tolerância de 2%, precisa ser o custo preciso conforme tabela de fretes\")" },
+          // PIS/COFINS não constam na tabela de frete da FSL (só ICMS, coluna
+          // "ALIQ %" da própria fatura) — descobertos batendo a aritmética de
+          // CT-es reais da fatura BTC Q2/ago-26 (Kate, 04/09/2026: "cruzamento
+          // coluna por coluna para chegar no FRETE TOTAL"): em toda linha
+          // testada, Fiscal/Base de cálculo = (soma de todos os componentes
+          // cobrados) ÷ (1 − ALIQ% − 1,65% − 7,60%), sempre com essas duas
+          // taxas fixas. Editável aqui só até confirmar oficialmente com a
+          // FSL/fiscal — não é um valor que a FSL declara em lugar nenhum da
+          // fatura ou da tabela.
+          { key: "pisPct", label: "PIS no gross-up do Frete Total (%) — NÃO CONFIRMADO", default: 1.65, source: "Não consta na fatura nem na tabela da FSL — inferido batendo a aritmética de faturas reais (04/09/2026). Confirmar com a FSL/fiscal." },
+          { key: "cofinsPct", label: "COFINS no gross-up do Frete Total (%) — NÃO CONFIRMADO", default: 7.60, source: "Mesma origem do PIS acima — inferido, não confirmado oficialmente com a FSL." },
         ],
       },
     ],
   };
+  // Pedágio, mínimo GRIS, TAS, Taxa de Despacho, % de Reentrega e mínimo de
+  // Reentrega são taxas da FSL — em vez de duplicá-las aqui, o validador lê
+  // direto da aba "Generalidades" da tabela de frete carregada a cada
+  // validação (Kate, 03/09/2026: se já está na tabela nova, não precisa
+  // ficar editável no sistema também — uma fonte só). Para reajustar,
+  // edite a célula "Valor" da linha correspondente naquela planilha.
 
   // ---- Leitura genérica de uma aba da fatura FSL (mesma lógica do
   // fsl_lib.py: CIDADE/UF por deslocamento a partir de REMETENTE/
@@ -2145,16 +2452,81 @@ https://github.com/nodeca/pako/blob/main/LICENSE
   // Out, cujo layout já foi confirmado numa fatura real) lança erro alto se
   // o layout não bater; `strict=false` (aba de Quiosques, layout ainda não
   // confirmado) segue sem REM_CIDADE/REM_UF quando não encontra.
+  // Candidatos de nome por campo — o layout confirmado (fsl_lib.py) usa os
+  // nomes à esquerda, mas casamos por sinônimo também (como o resto do
+  // sistema já faz para bases de layout não controlado por nós), porque uma
+  // fatura real já mostrou coluna de NF ausente do cruzamento com o SAP só
+  // por causa de um nome ligeiramente diferente — melhor tentar variações
+  // conhecidas do que silenciosamente não achar (Kate, 03/09/2026).
+  const FSL_CAMPOS_CANDIDATOS = {
+    "CT-E": ["CT-E", "CTE", "Nº CT-E", "N° CT-E", "Numero CT-E", "Número CT-E"],
+    TIPO: ["TIPO"],
+    "DATA CT-E": ["DATA CT-E", "Data CT-e", "Data Emissão CT-e", "Data de Emissão"],
+    "DATA FRETE": ["DATA FRETE", "Data Frete", "Data do Frete"],
+    PAGADOR: ["PAGADOR", "Pagador"],
+    "CNPJ PAGADOR": ["CNPJ PAGADOR", "CNPJ Pagador", "CNPJ do Pagador"],
+    REMETENTE: ["REMETENTE", "Remetente"],
+    "DESTINATÁRIO": ["DESTINATÁRIO", "DESTINATARIO", "Destinatário", "Destinatario"],
+    NF: ["NF", "Nota Fiscal", "NF-e", "NFe", "Nº NF", "N° NF", "Numero NF", "Número NF", "Núm. NF", "Núm NF-e", "Chave NF-e", "Nota"],
+    PESO: ["PESO", "Peso", "Peso (Kg)", "Peso Kg"],
+    VOL: ["VOL", "Volume", "Volumes", "Qtd Volumes"],
+    "VALOR NF": ["VALOR NF", "Valor NF", "Valor da NF", "Valor NF-e", "Vlr NF", "Valor Mercadoria", "Valor da Mercadoria"],
+    // "FRETE CORRIGIDO" é o novo nome de "FRETE TOTAL" numa versão mais
+    // recente da fatura (Kate, 10/09/2026) — mesma coluna, mesmo significado
+    // (valor final cobrado por CT-e, já com ICMS/PIS/COFINS embutidos).
+    "FRETE TOTAL": ["FRETE TOTAL", "Frete Total", "FRETE CORRIGIDO", "Frete Corrigido", "Vlr Frete Total", "Valor Total do Frete", "Vlr Total"],
+    // "Frete Peso" é o valor que a PRÓPRIA FSL já calculou pela faixa de peso
+    // (antes de pedágio/ADV/GRIS/taxas) — usado para inferir a região quando
+    // a cidade não é a capital e a tabela tem mais de uma sub-categoria além
+    // dela (ver resolverLinhaTabelaFSL). Kate, 03/09/2026: "na própria fatura
+    // da FSL consta o valor do frete peso [...] vc já tem como comparar em
+    // qual linha se enquadra na tabela de frete".
+    "FRETE PESO": ["FRETE PESO", "Frete Peso", "Vlr Frete Peso", "Valor Frete Peso"],
+    // Demais componentes cobrados linha a linha na fatura real — usados para
+    // validar CADA custo contra a tabela FSL (não só o Frete Total agregado),
+    // por pedido explícito da Kate (04/09/2026): "preciso que o sistema
+    // confirme todos os valores cobrados de cada aba, considerando os custos
+    // da tabela da FSL".
+    "PEDÁGIO": ["PEDÁGIO", "PEDAGIO", "Pedágio", "Pedagio"],
+    ADV: ["ADV", "Advalorem", "Ad Valorem", "ADVALOREM"],
+    GRIS: ["GRIS"],
+    TAS: ["TAS"],
+    // SEGURO/ENTREGA/SUFRAMA e os 4 campos fiscais abaixo — adicionados
+    // 04/09/2026 a pedido da Kate ("valide taxa com a tabela da FSL, até
+    // mesmo as generalidades, tudo precisa ser conferido"). Confirmado
+    // batendo a fatura real: soma de TODOS esses componentes (inclusive
+    // Seguro e SUFRAMA, que antes não eram lidos) é o que efetivamente
+    // reconcilia com FRETE TOTAL via o gross-up de impostos — ver
+    // calcularSellOutEsperado.
+    SEGURO: ["SEGURO", "Seguro"],
+    ENTREGA: ["ENTREGA", "Entrega"],
+    SUFRAMA: ["SUFRAMA", "Suframa"],
+    // "DESPACHO" e "BASE CALCULO" são os novos nomes dessas duas colunas
+    // (Kate, 10/09/2026) — mesma versão de fatura que renomeou FRETE TOTAL
+    // para FRETE CORRIGIDO.
+    "TAXA DE DESPACHO": ["TAXA DE DESPACHO", "Taxa de Despacho", "Taxa Despacho", "DESPACHO", "Despacho"],
+    "Fiscal/Base de cálculo": ["Fiscal/Base de cálculo", "Fiscal/Base de Calculo", "Base de Cálculo", "Base de Calculo", "BASE CALCULO", "BASE CÁLCULO"],
+    ICMS: ["ICMS"],
+    "Fiscal/Valor PIS": ["Fiscal/Valor PIS", "Valor PIS", "PIS"],
+    "Fiscal/Valor COFINS": ["Fiscal/Valor COFINS", "Valor COFINS", "COFINS"],
+    "Classificação/Descrição": ["Classificação/Descrição", "Classificacao/Descricao", "Classificação", "Descrição"],
+    "ALIQ %": ["ALIQ %", "Aliq %", "Alíquota", "Alíquota ICMS", "ALIQ ICMS"],
+    Status: ["Status"],
+    OBS: ["OBS", "OBS.", "Observação", "Observações"],
+  };
+
   function parseFSLAba(ws, nomeAba, strict) {
     const rows = sheetToRows(ws);
-    if (!rows.length) return { header: [], rows: [], idx: {} };
+    if (!rows.length) return { header: [], rows: [], idx: {}, naoEncontrados: [] };
     const header = rows[0].map((h) => (h === null || h === undefined ? "" : String(h).trim()));
     const idx = indexMap(header);
-    const CAMPOS = ["CT-E", "TIPO", "DATA CT-E", "DATA FRETE", "PAGADOR", "CNPJ PAGADOR",
-      "REMETENTE", "DESTINATÁRIO", "NF", "PESO", "VOL", "VALOR NF", "FRETE TOTAL",
-      "Classificação/Descrição", "ALIQ %", "Status", "OBS", "OBS."];
     const ix = {};
-    for (const nome of CAMPOS) if (nome in idx) ix[nome] = idx[nome];
+    const naoEncontrados = [];
+    for (const [campo, candidatos] of Object.entries(FSL_CAMPOS_CANDIDATOS)) {
+      const i = findColumnIdx(idx, candidatos);
+      if (i !== undefined) ix[campo] = i;
+      else naoEncontrados.push(campo);
+    }
     for (const [base, pref] of [["REMETENTE", "REM"], ["DESTINATÁRIO", "DEST"]]) {
       if (base in ix) {
         const i = ix[base];
@@ -2169,6 +2541,11 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     const out = [];
     for (const r of rows.slice(1)) {
       if (r[0] === null || r[0] === undefined || r[0] === "") continue;
+      // A fatura real da FSL repete o cabeçalho no meio da aba "Relatório de
+      // CTE" (linha 165 de 193, antes do bloco de Complementar/Devolução/
+      // Reentrega) — sem esse filtro essa linha vira um registro fantasma
+      // com CT-E="CT-E". Compara com o cabeçalho real, não um texto fixo.
+      if (String(r[0]).trim() === String(header[0]).trim()) continue;
       const g = (campo) => (ix[campo] !== undefined ? r[ix[campo]] : null);
       out.push({
         _raw: r,
@@ -2189,24 +2566,52 @@ https://github.com/nodeca/pako/blob/main/LICENSE
         vol: g("VOL"),
         valorNF: toNum(g("VALOR NF"), 0),
         freteTotal: toNum(g("FRETE TOTAL"), 0),
+        fretePesoFatura: toNum(g("FRETE PESO"), null),
+        pedagioFatura: toNum(g("PEDÁGIO"), null),
+        advFatura: toNum(g("ADV"), null),
+        grisFatura: toNum(g("GRIS"), null),
+        tasFatura: toNum(g("TAS"), null),
+        seguroFatura: toNum(g("SEGURO"), null),
+        entregaFatura: toNum(g("ENTREGA"), null),
+        suframaFatura: toNum(g("SUFRAMA"), null),
+        taxaDespachoFatura: toNum(g("TAXA DE DESPACHO"), null),
+        baseCalculoFatura: toNum(g("Fiscal/Base de cálculo"), null),
+        icmsFatura: toNum(g("ICMS"), null),
+        pisFatura: toNum(g("Fiscal/Valor PIS"), null),
+        cofinsFatura: toNum(g("Fiscal/Valor COFINS"), null),
         classificacaoDescricao: g("Classificação/Descrição"),
         aliqPct: toNum(g("ALIQ %"), 0),
         status: g("Status"),
-        obs: g("OBS") || g("OBS.") || null,
+        obs: g("OBS"),
       });
     }
-    return { header, rows: out, idx: ix };
+    return { header, rows: out, idx: ix, naoEncontrados };
   }
 
-  function findFSLSheet(wb, marcador) {
-    const name = wb.SheetNames.find((n) => normalizeText(n).includes(marcador));
-    return name ? wb.Sheets[name] : null;
+  // Retorna TODAS as abas cujo nome bate com algum marcador — a fatura real
+  // traz os quiosques em duas abas separadas por estado ("Abastecimento RJ",
+  // "Abastecimento MG"), não uma só. findFSLSheet (singular) fica para CTE/
+  // Sell Out/tabela de frete, que são sempre uma aba.
+  function findFSLSheets(wb, marcadores) {
+    const lista = Array.isArray(marcadores) ? marcadores : [marcadores];
+    return wb.SheetNames.filter((n) => lista.some((m) => normalizeText(n).includes(m))).map((n) => ({ name: n, ws: wb.Sheets[n] }));
+  }
+  function findFSLSheet(wb, marcadores) {
+    const found = findFSLSheets(wb, marcadores);
+    return found.length ? found[0].ws : null;
   }
 
   // ---- Tabela de frete FSL (vigência Q2 ago/2026) — UF + Região (não é
   // CEP como Diálogo/Loggi/Correios). Espera o formato gerado a partir do
   // PDF: aba "Tabela FSL Fracionado" com cabeçalho UF/Região/8 faixas de
   // peso/Frete Valor/Advalorem %/Prazo D+/Gris %/Seguro.
+  // Chaves lidas da aba "Generalidades" da tabela de frete — essas taxas
+  // acessórias são da FSL, então o lugar de ajustar um reajuste é editando a
+  // planilha (célula "Valor" da linha com essa Chave na coluna A) e subindo
+  // de novo, não um campo separado no painel de Parâmetros do sistema (Kate,
+  // 03/09/2026) — assim tudo que vem da FSL fica numa fonte só.
+  const FSL_GENERALIDADES_OBRIGATORIAS = ["pedagioPorFracao100kg", "grisMinimo", "tasPorCte", "taxaDespachoPorCte", "pctReentrega", "minReentrega"];
+
   function loadFslFreightTable(file) {
     return readWorkbook(file).then((wb) => {
       const sheetName = wb.SheetNames.find((n) => normalizeText(n).includes("tabela fsl")) || wb.SheetNames[0];
@@ -2235,18 +2640,78 @@ https://github.com/nodeca/pako/blob/main/LICENSE
           seguro: r[idx["Seguro"]],
         };
         map.set(`${uf}|${normalizeText(regiao)}`, entry);
-        // também indexa "<uf> capital" e "<uf> interior" normalizados para
-        // facilitar o lookup por classificação automática (só Capital tem
-        // regra de detecção confiável nesta versão — ver função abaixo).
       }
-      return map;
+
+      // ---- aba "Generalidades" — taxas acessórias por Chave (coluna A) ----
+      // Não trava a validação se faltar alguma chave (ou a aba inteira): a
+      // Kate pediu para validar o que a tabela TEM e reportar, por linha, o
+      // que não deu para validar e o motivo — não travar tudo por causa de
+      // uma célula vazia. Ver generalidadesFaltando, usado em validate().
+      const wsGen = wb.SheetNames.find((n) => normalizeText(n).includes("generalidade"));
+      const generalidades = {};
+      // Lista COMPLETA de itens da aba Generalidades (com ou sem Chave) —
+      // usada para tentar identificar cobranças "Complementar" da fatura
+      // contra QUALQUER custo listado na tabela (Estadia de Veículo,
+      // Paletização, TDE, SUFRAMA etc.), não só as 6 chaves usadas na
+      // fórmula principal do frete. Kate, 03/09/2026.
+      const generalidadesLista = [];
+      if (wsGen) {
+        const genRows = sheetToRows(wb.Sheets[wsGen]);
+        for (const r of genRows.slice(1)) {
+          const chave = r[0] !== null && r[0] !== undefined ? String(r[0]).trim() : "";
+          const item = r[1] !== null && r[1] !== undefined ? String(r[1]).trim() : "";
+          const v = toNum(r[2], null);
+          const unidade = r[3] !== null && r[3] !== undefined ? String(r[3]).trim() : "";
+          if (chave) {
+            if (v !== null) generalidades[chave] = v;
+          }
+          if (item) generalidadesLista.push({ item, valor: v, unidade, valorTexto: r[2] });
+        }
+      }
+      const generalidadesFaltando = FSL_GENERALIDADES_OBRIGATORIAS.filter((k) => generalidades[k] === undefined);
+      return { tabela: map, generalidades, generalidadesLista, generalidadesFaltando, abaGeneralidadesEncontrada: !!wsGen };
     });
+  }
+
+  const FSL_GENERALIDADES_LABEL = {
+    pedagioPorFracao100kg: "Pedágio por fração de 100kg",
+    grisMinimo: "Mínimo de GRIS",
+    tasPorCte: "TAS por CT-e",
+    taxaDespachoPorCte: "Taxa de Despacho por CT-e",
+    pctReentrega: "% de Reentrega",
+    minReentrega: "Mínimo de Reentrega",
+  };
+
+  // Frete pela faixa de peso de UMA linha da tabela (bracket ou excedente
+  // acima da última faixa) — usado tanto para calcular o esperado quanto,
+  // de trás para frente, para inferir a região por eliminação de valor
+  // (ver resolverLinhaTabelaFSL).
+  function calcularFretePesoTabela(entry, peso) {
+    const idxAcima = entry.bracketLimits.findIndex((lim) => peso <= lim + 1e-9);
+    if (idxAcima >= 0) return entry.brackets[idxAcima];
+    // Acima da última faixa (200kg): valor da faixa de 200kg + o EXCEDENTE
+    // sobre 200kg × "Frete Valor (exc. R$/kg)" — NÃO peso total × excedente
+    // (aquela era a regra da tabela antiga, só até 100kg — sellout.md).
+    // Fórmula nova confirmada pela Kate, 10/09/2026, com exemplo conferido:
+    // peso 250kg, RJ C-Capital (Até 200kg = R$199,96, exc. = R$1,51/kg) →
+    // 199,96 + (250−200)×1,51 = R$275,46.
+    const ultimoLimite = entry.bracketLimits[entry.bracketLimits.length - 1];
+    const ultimoValor = entry.brackets[entry.brackets.length - 1];
+    return ultimoValor + (peso - ultimoLimite) * (entry.freteExc || 0);
   }
 
   // Só resolve a região com segurança quando é a capital do estado — as
   // demais categorias (Interior / Grande porte / Interior 2 / Fluvial) não
   // têm um mapa de cidade->categoria disponível. Ver nota no topo do módulo.
-  function resolverLinhaTabelaFSL(tabela, uf, cidade) {
+  // `opts.peso` + `opts.freteFaturaDeclarado` (o "FRETE PESO" que a própria
+  // FSL já escreveu na fatura) permitem uma segunda tentativa de resolução
+  // quando há 2+ sub-categorias além da capital: comparamos o que CADA
+  // região daria pelo peso desta linha contra o valor que a FSL já declarou
+  // — se só uma bate, é essa (Kate, 03/09/2026: "na própria fatura da FSL
+  // consta o valor do frete peso [...] já dá pra comparar em qual linha se
+  // enquadra", exemplo MG/G-Grande via R$54,08).
+  function resolverLinhaTabelaFSL(tabela, uf, cidade, opts) {
+    opts = opts || {};
     if (!uf) return { entry: null, motivo: "UF do destinatário ausente na fatura." };
     const ufU = String(uf).trim().toUpperCase();
     const capital = FSL_CAPITAIS[ufU];
@@ -2255,81 +2720,375 @@ https://github.com/nodeca/pako/blob/main/LICENSE
       if (entry) return { entry, motivo: null };
       return { entry: null, motivo: `Linha "${ufU} C-Capital" não encontrada na tabela de frete carregada.` };
     }
-    return { entry: null, motivo: `Cidade "${cidade}" não é a capital de ${ufU} — a tabela nova tem sub-categorias (Interior/Grande/Interior 2/Fluvial) sem mapa de cidade->categoria disponível. Classifique manualmente.` };
+    // Cidade fora da capital. Se a tabela desse UF só tem UMA linha além da
+    // capital, essa é a única opção possível — resolve por eliminação, sem
+    // precisar de mapa de cidade->região (ex.: RJ só tem "C-Capital" e
+    // "G-Grande" nesta tabela — qualquer cidade do RJ que não seja a capital
+    // só pode ser "G-Grande", nem que seja "Nova Iguaçu"). Com 2+ linhas além
+    // da capital (MG/PR/RS/SC/DF/ES/GO/TO/PA) tenta pelo Frete Peso declarado
+    // antes de desistir — Kate, 03/09/2026.
+    const entriesDoUf = [];
+    for (const [key, val] of tabela.entries()) {
+      if (key.startsWith(`${ufU}|`)) entriesDoUf.push(val);
+    }
+    const naoCapital = entriesDoUf.filter((e) => !["c-capital", "capital"].includes(normalizeText(e.regiao)));
+    if (naoCapital.length === 1) {
+      return { entry: naoCapital[0], motivo: null, resolvidoPorEliminacao: true };
+    }
+    if (naoCapital.length > 1 && opts.peso != null && opts.freteFaturaDeclarado != null) {
+      const TOL = 0.05; // arredondamento de centavos
+      const bateram = naoCapital.filter((e) => Math.abs(calcularFretePesoTabela(e, opts.peso) - opts.freteFaturaDeclarado) <= TOL);
+      if (bateram.length === 1) {
+        return { entry: bateram[0], motivo: null, resolvidoPorFretePeso: true };
+      }
+    }
+    const opcoes = naoCapital.map((e) => e.regiao).join(", ") || "nenhuma";
+    let motivo = `Cidade "${cidade}" não é a capital de ${ufU} — a tabela tem ${naoCapital.length} sub-categorias além da capital para esse UF (${opcoes}), sem mapa de cidade->região disponível.`;
+    if (opts.peso != null && opts.freteFaturaDeclarado != null) {
+      motivo += ` Tentei inferir pela Frete Peso declarada na fatura (${fmtMoney(opts.freteFaturaDeclarado)} para ${opts.peso}kg), mas não bateu com exatamente uma região.`;
+    } else {
+      motivo += ` Classifique manualmente (ou confira se a fatura traz a coluna "FRETE PESO" — dá pra inferir a região por eliminação de valor).`;
+    }
+    return { entry: null, motivo };
   }
 
-  function calcularSellOutEsperado(row, tabela, params) {
-    const { entry, motivo } = resolverLinhaTabelaFSL(tabela, row.destUf, row.destCidade);
-    if (!entry) return { esperado: null, motivo };
-    const peso = row.peso || 0;
-    let fretePeso;
-    const idxAcima = entry.bracketLimits.findIndex((lim) => peso <= lim + 1e-9);
-    if (idxAcima >= 0) {
-      fretePeso = entry.brackets[idxAcima];
-    } else {
-      fretePeso = peso * (entry.freteExc || 0); // acima da última faixa: peso TOTAL x excedente (sellout.md)
+  // Os 4 componentes abaixo vêm obrigatoriamente da aba Generalidades — se
+  // algum não está informado na tabela enviada, não dá pra confiar no total
+  // (defaultar pra R$0 esconderia um custo real). A linha fica "AVALIAR",
+  // não trava as demais: só essa parte não foi possível validar.
+  const FSL_GENERALIDADES_DO_CALC_FRETE = ["pedagioPorFracao100kg", "grisMinimo", "tasPorCte", "taxaDespachoPorCte"];
+
+  // Compara UM componente do frete (Frete Peso/Pedágio/ADV/GRIS/TAS/Taxa de
+  // Despacho) cobrado na própria fatura contra o valor esperado pela
+  // tabela — pedido da Kate (04/09/2026): "preciso que o sistema confirme
+  // todos os valores cobrados de cada aba, considerando os custos da
+  // tabela da FSL", não só o Frete Total agregado. Quando a fatura não tem
+  // aquela coluna (cobrado null), fica "—" (não verificável) em vez de
+  // "OK" — nunca inventa um resultado sobre algo que não foi conferido.
+  function compararComponente(cobrado, esperado, tol) {
+    if (cobrado === null || cobrado === undefined) {
+      return { cobrado: null, esperado: round2(esperado), desvio: null, situacao: "—" };
     }
-    const pedagio = (params.pedagioPorFracao100kg || 0) * Math.ceil(peso / 100 || 0);
+    const desvio = round2(cobrado - esperado);
+    return { cobrado: round2(cobrado), esperado: round2(esperado), desvio, situacao: Math.abs(desvio) <= tol ? "OK" : "DIVERGENTE" };
+  }
+
+  const FSL_COMPONENTE_LABEL = {
+    fretePeso: "Frete Peso", pedagio: "Pedágio", adv: "ADV", gris: "GRIS", tas: "TAS", taxaDespacho: "Taxa de Despacho",
+    seguro: "Seguro", suframa: "SUFRAMA",
+  };
+
+  // Resumo textual de quais componentes bateram, usado na coluna
+  // "ItensDivergentes" — vazio quando tudo OK, "—" quando não se aplica
+  // (linha 4 Elos / Reentrega / Devolução / Complementar / AVALIAR).
+  function resumoItensDivergentes(componentes) {
+    if (!componentes) return "—";
+    const divergentes = Object.entries(componentes)
+      .filter(([, c]) => c.situacao === "DIVERGENTE")
+      .map(([k, c]) => `${FSL_COMPONENTE_LABEL[k] || k}: cobrado ${fmtMoney(c.cobrado)} x esperado ${fmtMoney(c.esperado)} (dif. ${fmtMoney(c.desvio)})`);
+    return divergentes.join("; ");
+  }
+
+  // Seguro por região: coluna "Seguro" da tabela — vem em % sobre o valor da
+  // NF (mesma escala do Gris %, ex.: 0,02 = 0,02%) para Norte/Nordeste/
+  // Centro-Oeste, ou o texto "ISENTO" para Sudeste/Sul (0 nesse caso). Kate,
+  // 04/09/2026: "valide taxa com a tabela da FSL, até mesmo as
+  // generalidades" — Seguro nunca tinha sido lido nem validado antes.
+  function calcularSeguroTabela(entry, valorNF) {
+    if (!entry || typeof entry.seguro !== "number") return 0; // "ISENTO" ou célula vazia
+    return (valorNF || 0) * (entry.seguro / 100);
+  }
+
+  // SUFRAMA: regra passada por escrito pela Kate (04/09/2026) — "Suframa só
+  // tem em Manaus/AM, já é um valor indevido se constar em outra UF". Não é
+  // um valor fixo daqui do sistema: lemos "Taxa de Administração do SUFRAMA"
+  // da própria aba Generalidades da tabela (R$40,00/conhecimento na tabela
+  // vigente), então um reajuste da FSL não exige mexer no código. Fora do AM
+  // o esperado é sempre R$0 — qualquer valor cobrado ali já é divergência,
+  // não precisa nem olhar a tabela.
+  function calcularSuframaEsperado(destUf, generalidadesLista) {
+    const ufU = String(destUf || "").trim().toUpperCase();
+    if (ufU !== "AM") return 0;
+    const item = buscarItemGeneralidade(generalidadesLista, "administracao do suframa");
+    return item ? item.valor : 40; // fallback ao valor conhecido da tabela vigente, se o texto mudar
+  }
+
+  // ENTREGA (coluna da fatura): regra passada por escrito pela Kate
+  // (10/09/2026) — "os complementares e algumas entregas normais possuem a
+  // taxa de Entrega (custos em generalidades) quando há necessidade de
+  // agendamento por parte da FSL". Ou seja, é uma cobrança legítima e
+  // discricionária (não dá pra saber pela fatura QUANDO o agendamento foi
+  // necessário) — então o validador não exige Entrega em toda linha, mas
+  // QUANDO ela é cobrada, confere se o valor bate com a faixa de peso certa
+  // da tabela "Entrega com Veículo Dedicado" (Generalidades): Van até
+  // 1.400kg, Leve 1.401-3.500kg, Toco 3.501-7.000kg, Truck 7.001-13.000kg,
+  // Conjunto/Cavalo+Carreta acima de 13.001kg.
+  function buscarTiersEntregaVeiculo(generalidadesLista) {
+    const tiers = [];
+    for (const g of generalidadesLista || []) {
+      if (typeof g.valor !== "number") continue;
+      const nomeNorm = normalizeText(g.item || "");
+      if (!nomeNorm.startsWith("entrega com veiculo dedicado")) continue;
+      const parenMatch = String(g.item).match(/\(([^)]+)\)/);
+      if (!parenMatch) continue;
+      const faixaNorm = normalizeText(parenMatch[1]);
+      const nums = (faixaNorm.match(/[\d.]+/g) || []).map((s) => Number(s.replace(/\./g, "")));
+      if (!nums.length) continue;
+      let min = 0;
+      let max = Infinity;
+      if (faixaNorm.includes("acima")) {
+        min = nums[0];
+      } else if (nums.length >= 2) {
+        min = nums[0];
+        max = nums[1];
+      } else {
+        max = nums[0];
+      }
+      tiers.push({ min, max, valor: g.valor, label: g.item });
+    }
+    tiers.sort((a, b) => a.min - b.min);
+    return tiers;
+  }
+  function calcularEntregaVeiculoEsperado(peso, tiers) {
+    if (!tiers || !tiers.length) return null; // tabela não trouxe as faixas — não dá pra validar
+    const t = tiers.find((t) => peso >= t.min - 1e-6 && peso <= t.max + 1e-6);
+    return t ? t.valor : null; // peso fora de toda faixa conhecida (ex.: acima da última) — não dá pra validar
+  }
+
+  function calcularSellOutEsperado(row, tabela, generalidades, params, generalidadesLista) {
+    const faltandoNesteCalc = FSL_GENERALIDADES_DO_CALC_FRETE.filter((k) => generalidades[k] === undefined);
+    if (faltandoNesteCalc.length) {
+      const nomes = faltandoNesteCalc.map((k) => FSL_GENERALIDADES_LABEL[k] || k).join(", ");
+      return { esperado: null, motivo: `Não validado — a tabela de frete não informa: ${nomes}. Corrija a aba "Generalidades" e reenvie para validar esta linha.` };
+    }
+    const peso = row.peso || 0;
+    const { entry, motivo, resolvidoPorEliminacao, resolvidoPorFretePeso } = resolverLinhaTabelaFSL(tabela, row.destUf, row.destCidade, { peso, freteFaturaDeclarado: row.fretePesoFatura });
+    if (!entry) return { esperado: null, motivo };
+    const fretePeso = calcularFretePesoTabela(entry, peso);
+    // Pedágio/GRIS mínimo/TAS/Taxa de Despacho vêm da aba Generalidades da
+    // própria tabela de frete carregada — só o mínimo de Advalorem (não
+    // informado pela FSL nesta tabela) fica no painel de Parâmetros.
+    const pedagio = (generalidades.pedagioPorFracao100kg || 0) * Math.ceil(peso / 100 || 0);
     const adv = Math.max(params.advMinimo || 0, (row.valorNF || 0) * (entry.advPct / 100));
-    const gris = Math.max(params.grisMinimo || 0, (row.valorNF || 0) * (entry.grisPct / 100));
-    const taxasFixas = (params.tasPorCte || 0) + (params.taxaDespachoPorCte || 0);
-    const subtotal = fretePeso + pedagio + adv + gris + taxasFixas;
-    const aliq = (row.aliqPct || 0) / 100;
-    const total = aliq < 1 ? subtotal / (1 - aliq) : subtotal;
+    const gris = Math.max(generalidades.grisMinimo || 0, (row.valorNF || 0) * (entry.grisPct / 100));
+    const tas = generalidades.tasPorCte || 0;
+    const taxaDespacho = generalidades.taxaDespachoPorCte || 0;
+    const seguro = calcularSeguroTabela(entry, row.valorNF);
+    const suframa = calcularSuframaEsperado(row.destUf, generalidadesLista);
+    const taxasFixas = tas + taxaDespacho;
+    // ENTREGA (Kate, 10/09/2026): cobrança legítima e discricionária — a
+    // FSL cobra quando precisou agendar a entrega, o que não dá pra saber
+    // pela fatura sozinha. Por isso só entra no subtotal QUANDO foi de fato
+    // cobrada nesta linha (não exigimos em toda linha), mas aí validamos se
+    // o valor bate com a faixa de peso certa da tabela "Entrega com Veículo
+    // Dedicado" — ver calcularEntregaVeiculoEsperado.
+    const entregaTiers = buscarTiersEntregaVeiculo(generalidadesLista);
+    const entregaFoiCobrada = row.entregaFatura !== null && row.entregaFatura !== undefined && Math.abs(row.entregaFatura) > 0.005;
+    const entregaTierEsperado = entregaFoiCobrada ? calcularEntregaVeiculoEsperado(peso, entregaTiers) : null;
+    const entregaNoSubtotal = entregaFoiCobrada ? (entregaTierEsperado !== null ? entregaTierEsperado : row.entregaFatura) : 0;
+    const subtotal = fretePeso + pedagio + adv + gris + seguro + suframa + taxasFixas + entregaNoSubtotal;
+    // Gross-up de impostos: por instrução da Kate (04/09/2026, "cruzamento
+    // coluna por coluna para chegar no FRETE TOTAL"), batendo a aritmética de
+    // CT-es reais descobrimos que o ICMS (coluna ALIQ% da própria fatura) não
+    // é o único imposto embutido — PIS e COFINS também entram (ver os
+    // parâmetros "NÃO CONFIRMADO" acima). Sem eles o valor esperado ficava
+    // sistematicamente abaixo do Frete Total cobrado em toda fatura real
+    // testada.
+    const aliqIcms = (row.aliqPct || 0) / 100;
+    const aliqPis = (params.pisPct || 0) / 100;
+    const aliqCofins = (params.cofinsPct || 0) / 100;
+    const aliqTotal = aliqIcms + aliqPis + aliqCofins;
+    const total = aliqTotal < 1 ? subtotal / (1 - aliqTotal) : subtotal;
+    // Confere CADA componente cobrado na própria fatura (quando a coluna
+    // existir) contra o que a tabela FSL diz que deveria ser — não só o
+    // Frete Total agregado (Kate, 04/09/2026).
+    const tolItem = params.toleranciaArredondamento || 1;
+    const componentes = {
+      fretePeso: compararComponente(row.fretePesoFatura, fretePeso, tolItem),
+      pedagio: compararComponente(row.pedagioFatura, pedagio, tolItem),
+      adv: compararComponente(row.advFatura, adv, tolItem),
+      gris: compararComponente(row.grisFatura, gris, tolItem),
+      tas: compararComponente(row.tasFatura, tas, tolItem),
+      taxaDespacho: compararComponente(row.taxaDespachoFatura, taxaDespacho, tolItem),
+      seguro: compararComponente(row.seguroFatura, seguro, tolItem),
+      suframa: compararComponente(row.suframaFatura, suframa, tolItem),
+      // Entrega: só comparamos quando foi cobrada E a tabela tem a faixa de
+      // peso certa pra validar o valor (Kate, 10/09/2026 — ver comentário
+      // acima). Sem cobrança, ou sem faixa pra validar, fica "—".
+      entrega: entregaFoiCobrada
+        ? entregaTierEsperado !== null
+          ? compararComponente(row.entregaFatura, entregaTierEsperado, tolItem)
+          : { cobrado: round2(row.entregaFatura), esperado: null, desvio: null, situacao: "—" }
+        : { cobrado: null, esperado: null, desvio: null, situacao: "—" },
+    };
     return {
       esperado: round2(total),
-      motivo: null,
-      detalhe: { fretePeso: round2(fretePeso), pedagio: round2(pedagio), adv: round2(adv), gris: round2(gris), taxasFixas: round2(taxasFixas), subtotal: round2(subtotal) },
+      // Nota informativa (não é uma ressalva/incerteza — Kate, 10/09/2026:
+      // "se não for Capital, valide na outra linha Interior ou G-Grande" —
+      // a linha já É validada normalmente, isso só documenta qual linha da
+      // tabela foi usada, pra auditoria).
+      motivo: resolvidoPorEliminacao
+        ? `Região usada: "${entry.regiao}" (${entry.uf}) — cidade não é a capital, e essa é a única linha não-capital dessa UF na tabela.`
+        : resolvidoPorFretePeso
+        ? `Região usada: "${entry.regiao}" (${entry.uf}) — identificada pelo "Frete Peso" que a própria FSL já declarou na fatura (${fmtMoney(row.fretePesoFatura)} para ${peso}kg bate com essa linha da tabela).`
+        : null,
+      detalhe: { fretePeso: round2(fretePeso), pedagio: round2(pedagio), adv: round2(adv), gris: round2(gris), seguro: round2(seguro), suframa: round2(suframa), taxasFixas: round2(taxasFixas), subtotal: round2(subtotal) },
+      componentes,
     };
   }
 
-  // ---- Classificação do grupo tarifário (aba CTE) — ver tarifas.md ----
-  function classificarCTE(row, params) {
-    const tipoN = normalizeText(row.tipo);
-    if (tipoN.includes("reentreg")) {
-      return { grupo: "Reentrega", pctEsperado: null, valorEsperado: null, observacao: "50% do CT-e original (Generalidades) — confira se o CT-e original consta do relatório." };
-    }
-    if (tipoN.includes("devol")) {
-      return { grupo: "Devolução", pctEsperado: null, valorEsperado: null, observacao: "Vazio contratual — tabela FSL diz 100% da tabela vigente, mas o acordo Sallve é por %, sem percentual definido para devolução. Não contestar sem antes definir o critério com a FSL." };
-    }
-    if (tipoN.includes("complement")) {
-      return { grupo: "Complementar", pctEsperado: null, valorEsperado: null, observacao: "Sem % automático — exigir memória de cálculo e aprovação prévia da Sallve; ônus da comprovação é da FSL." };
-    }
-
+  // ---- Direção do CT-e (Inbound/Outbound/Transferência) — usada SÓ para
+  // escolher contra qual base do SAP (entrada ou saída) cruzar a NF. Não
+  // afeta mais o valor esperado: por instrução da Kate (03/09/2026), os %
+  // antigos por grupo tarifário (Cross-docking 1%, Inbound 1,5%, Outbound
+  // 1,3%, Transferência 1,3%, Estado do RJ 1,8% — de tarifas.md) não valem
+  // mais. O valor esperado de TODO CT-e "Normal" agora vem da tabela de
+  // frete nova (mesma fórmula do Sell Out), exceto a exceção da 4 Elos.
+  function direcaoCTE(row) {
     const remSallveBtc = ehSallveOuBtc(row.remetente);
     const destSallveBtc = ehSallveOuBtc(row.destinatario);
-    let grupo, pctBase;
-    if (!remSallveBtc && destSallveBtc) {
-      if (normalizeText(row.destinatario).includes("btc")) {
-        grupo = "Cross-docking (fábrica × BTC)"; pctBase = params.pctCrossDocking;
-      } else {
-        grupo = "Inbound"; pctBase = params.pctInbound;
-      }
-    } else if (remSallveBtc && !destSallveBtc) {
-      grupo = "Outbound"; pctBase = params.pctOutbound;
-    } else if (remSallveBtc && destSallveBtc) {
-      if (normalizeText(row.remetente).includes("btc") && String(row.destUf || "").toUpperCase() === "SP") {
-        grupo = "Cross-docking (BTC × filial SP)"; pctBase = params.pctCrossDocking;
-      } else {
-        grupo = "Transferência"; pctBase = params.pctTransferencia;
-      }
-    } else {
-      return { grupo: "Indeterminado", pctEsperado: null, valorEsperado: null, observacao: `Nem remetente ("${row.remetente}") nem destinatário ("${row.destinatario}") identificados como Sallve/BTC — confira este CT-e manualmente (armadilhas.md).` };
-    }
+    if (!remSallveBtc && destSallveBtc) return "Inbound";
+    if (remSallveBtc && !destSallveBtc) return "Outbound";
+    if (remSallveBtc && destSallveBtc) return "Transferência";
+    return "Indeterminado";
+  }
 
-    let pct = pctBase;
-    let observacao = "";
-    if (row.cnpjPagador === FSL_CNPJ_RJ) {
-      if (eh4Elos(row.remetente) || eh4Elos(row.destinatario)) {
-        pct = params.pct4ElosRJ;
-        observacao = "Regra específica: CNPJ pagador RJ + nota da 4 Elos → % fixo, substitui o grupo tarifário padrão.";
-      } else {
-        pct = params.pctRJ;
-        observacao = "CNPJ pagador é a filial RJ → % do estado do RJ se sobrepõe ao grupo tarifário padrão (regra adotada: por CNPJ pagador, não por UF de origem/destino — confirmar se ainda vale).";
+  // ---- Valor esperado de uma linha "Normal" (CTE ou Sell Out) — pela
+  // tabela de frete nova, com a única exceção passada por escrito: CNPJ
+  // pagador da filial RJ + nota da 4 Elos, que sai a um % fixo sobre o
+  // valor da NF em vez do cálculo pela tabela.
+  function calcularFreteEsperado(row, tabela, generalidades, params, generalidadesLista) {
+    if (row.cnpjPagador === FSL_CNPJ_RJ && (eh4Elos(row.pagador) || eh4Elos(row.remetente) || eh4Elos(row.destinatario))) {
+      // Exceção passada por escrito (Kate, 04/09/2026): notas com "4 ELOS"
+      // no nome e CNPJ pagador da filial RJ NÃO entram na validação por
+      // Frete Peso/tabela — vão só pelo percentual sobre a NF. Por isso não
+      // há quebra por componente (Frete Peso/Pedágio/ADV/GRIS/TAS/Taxa de
+      // Despacho) para essas linhas — método é outro, não comparável.
+      return {
+        esperado: round2((row.valorNF || 0) * (params.pct4ElosRJ / 100)),
+        motivo: null,
+        metodo: `4 Elos (${params.pct4ElosRJ}% da NF)`,
+        componentes: null,
+      };
+    }
+    const calc = calcularSellOutEsperado(row, tabela, generalidades, params, generalidadesLista);
+    return { esperado: calc.esperado, motivo: calc.motivo, metodo: "Tabela de frete", detalhe: calc.detalhe, componentes: calc.componentes };
+  }
+
+  // ---- Classificação de uma linha da aba CTE. Reentrega/Devolução/
+  // Complementar continuam tratadas à parte (não são % de tabela — vêm das
+  // Generalidades da própria tabela nova: Reentrega/mín. Reentrega,
+  // Devolução sem critério definido, Complementar sem cálculo automático).
+  // Toda linha "Normal" usa calcularFreteEsperado acima.
+  // Tenta explicar uma cobrança "Complementar" batendo o valor cobrado
+  // contra QUALQUER item de R$ fixo listado na aba Generalidades (Estadia
+  // de Veículo, Entrega Dedicada, Paletização, TDE, SUFRAMA etc.) — inclusive
+  // como múltiplo inteiro (ex.: 2 diárias de estadia). Só sinaliza como
+  // possível correspondência; nunca aprova sozinho. Kate, 03/09/2026: "vc
+  // pode verificar se correspondem em algum custo da tabela e se não
+  // corresponder a nenhum, sinalizar".
+  function identificarCobrancaComplementar(valorCobrado, generalidadesLista) {
+    if (!valorCobrado || !Array.isArray(generalidadesLista)) return [];
+    const TOL = 0.05; // arredondamento de centavos
+    const candidatos = [];
+    for (const g of generalidadesLista) {
+      if (typeof g.valor !== "number" || g.valor <= 0) continue;
+      // Só itens de valor FIXO em R$ — itens em % (TDE, GRIS, Devolução,
+      // Reentrega, TRF, Seguro Fluvial/Permanência...) não são um valor a
+      // bater como múltiplo inteiro; um "10" de TDE-10% coincidir com R$10
+      // cobrados seria um falso positivo. TDE tem tratamento próprio em
+      // calcularTdeEsperado (% sobre o frete original).
+      if (g.unidade && /%|isento/i.test(g.unidade)) continue;
+      for (let k = 1; k <= 20; k++) {
+        const alvo = g.valor * k;
+        if (Math.abs(valorCobrado - alvo) <= TOL) {
+          candidatos.push({ item: g.item, unidade: g.unidade, valorUnitario: g.valor, multiplicador: k });
+          break; // não faz sentido testar k maiores pro mesmo item
+        }
       }
     }
-    const valorEsperado = round2((row.valorNF || 0) * (pct / 100));
-    return { grupo, pctEsperado: pct, valorEsperado, observacao };
+    // Correspondência exata (k=1) primeiro, depois pelas menores multiplicidades.
+    candidatos.sort((a, b) => a.multiplicador - b.multiplicador);
+    return candidatos;
+  }
+
+  // Acha um item da aba Generalidades pelo texto (contains, sem acento/caixa)
+  // — usado para achar TDE/Mínimo TDE mesmo que a redação exata mude um
+  // pouco entre reajustes da tabela.
+  function buscarItemGeneralidade(generalidadesLista, textoContem, textoExclui) {
+    if (!Array.isArray(generalidadesLista)) return null;
+    return generalidadesLista.find((g) => {
+      const t = normalizeText(g.item);
+      if (!t.includes(textoContem)) return false;
+      if (textoExclui && t.includes(textoExclui)) return false;
+      return typeof g.valor === "number";
+    }) || null;
+  }
+
+  // TDE (Taxa de Dificuldade de Entrega) é % sobre o frete original, com
+  // piso em R$ — diferente dos demais itens de Complementar, que são valor
+  // fixo (por isso não cai em identificarCobrancaComplementar). Kate,
+  // 03/09/2026: os CT-es Complementar da fatura são de "Entrega com Veículo
+  // Dedicado" (fixo, já coberto acima) e "TDE" (este aqui).
+  function calcularTdeEsperado(freteOriginal, generalidadesLista) {
+    if (!freteOriginal) return null;
+    const pctItem = buscarItemGeneralidade(generalidadesLista, "tde", "minimo");
+    if (!pctItem) return null;
+    const minItem = buscarItemGeneralidade(generalidadesLista, "minimo tde");
+    const pct = pctItem.valor;
+    const minimo = minItem ? minItem.valor : 0;
+    return { valor: Math.max(freteOriginal * (pct / 100), minimo), pct, minimo };
+  }
+
+  function classificarLinhaCTE(row, tabela, generalidades, params, generalidadesLista, freteOriginalPorNF) {
+    const tipoN = normalizeText(row.tipo);
+    if (tipoN.includes("reentreg")) {
+      const pct = generalidades.pctReentrega, min = generalidades.minReentrega;
+      const regra = pct !== undefined && min !== undefined
+        ? `${pct}% do CT-e original, mínimo R$${min} (Generalidades da tabela)`
+        : `Não validado — a tabela de frete não informa % de Reentrega e/ou Mínimo de Reentrega`;
+      return { metodo: "Reentrega", esperado: null, observacao: `${regra} — confira se o CT-e original consta do relatório.`, componentes: null };
+    }
+    if (tipoN.includes("devol")) {
+      return { metodo: "Devolução", esperado: null, observacao: "Vazio contratual — a tabela diz 100% do frete original, mas não há critério definido com a FSL para devolução. Não contestar sem antes alinhar o critério.", componentes: null };
+    }
+    if (tipoN.includes("complement")) {
+      const matches = identificarCobrancaComplementar(row.freteTotal, generalidadesLista);
+      const explicacoes = [];
+      if (matches.length) {
+        const desc = matches.slice(0, 3).map((m) => m.multiplicador === 1
+          ? `${fmtMoney(m.valorUnitario)} = "${m.item}" (${m.unidade})`
+          : `${m.multiplicador}× ${fmtMoney(m.valorUnitario)} = "${m.item}" (${m.unidade})`).join("; ");
+        explicacoes.push(`bate com um custo fixo da tabela: ${desc}`);
+      }
+      // TDE é % sobre o frete original (não fixo, por isso não aparece em
+      // identificarCobrancaComplementar) — só dá pra testar se a NF deste
+      // Complementar também aparece numa linha "Normal" da fatura, de onde
+      // tiramos o frete original. Kate, 03/09/2026.
+      const nfsComplementar = expandirNFs(row.nf);
+      let freteOriginal = 0;
+      for (const nf of nfsComplementar) {
+        if (freteOriginalPorNF && freteOriginalPorNF.has(nf)) freteOriginal += freteOriginalPorNF.get(nf);
+      }
+      if (freteOriginal > 0) {
+        const tde = calcularTdeEsperado(freteOriginal, generalidadesLista);
+        if (tde) {
+          const bate = Math.abs(row.freteTotal - round2(tde.valor)) <= (params.toleranciaArredondamento || 1);
+          explicacoes.push(`TDE (${tde.pct}% sobre o frete original de R$${fmtMoney(freteOriginal)} da(s) NF(s) ${nfsComplementar.join(", ")}, mínimo R$${fmtMoney(tde.minimo)}) esperaria R$${fmtMoney(tde.valor)}${bate ? " — bate com o valor cobrado" : " — NÃO bate com o valor cobrado"}`);
+        }
+      } else if (nfsComplementar.length) {
+        explicacoes.push(`não achei nenhuma linha "Normal" com a(s) NF(s) ${nfsComplementar.join(", ")} nesta fatura para calcular o TDE (10% sobre o frete original) — sem o frete original, não dá pra validar essa hipótese`);
+      }
+      let observacao;
+      if (explicacoes.length) {
+        observacao = `Possíveis explicações — ${explicacoes.join("; ")}. O validador só bateu valores, não sabe qual serviço foi de fato prestado: confirmar com a FSL antes de aprovar.`;
+      } else {
+        observacao = "Não corresponde a nenhum custo listado na aba Generalidades da tabela de frete (nem como múltiplo inteiro de um valor fixo, nem como TDE sobre o frete original) — exigir memória de cálculo e aprovação prévia da Sallve; ônus da comprovação é da FSL.";
+      }
+      return { metodo: "Complementar", esperado: null, observacao, componentes: null };
+    }
+    const calc = calcularFreteEsperado(row, tabela, generalidades, params, generalidadesLista);
+    return { metodo: calc.metodo, esperado: calc.esperado, observacao: calc.motivo || "", componentes: calc.componentes || null };
   }
 
   function fmtNum(v) { return v === null || v === undefined ? "" : v; }
@@ -2338,7 +3097,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     id: "fsl",
     label: "FSL (Fretes CTE / Sell Out / Quiosques)",
     description:
-      "Valida o relatório mensal da FSL — Fretes CTE (% por grupo tarifário), Sell Out (recálculo pela tabela de frete fracionado) e Quiosques (valor mensal fechado por estado) — e cruza com a base SAP quando enviada. v1: veja os avisos em tela sobre a aba de Quiosques (layout ainda não confirmado numa fatura real) e sobre a classificação de região do Sell Out (só capital é automática nesta tabela nova).",
+      "Valida o relatório mensal da FSL — Fretes CTE e Sell Out (ambos recalculados pela tabela de frete nova, vigência Q2 ago/2026, com a exceção da 4 Elos) e Quiosques (valor mensal fechado por estado) — e cruza com a base SAP quando enviada. v1: veja os avisos em tela sobre a aba de Quiosques (layout ainda não confirmado numa fatura real) e sobre a classificação de região (só capital é automática nesta tabela nova).",
     params: FSL_PARAMS_DEFAULT,
     inputs: [
       {
@@ -2381,14 +3140,22 @@ https://github.com/nodeca/pako/blob/main/LICENSE
       const params = currentParams();
 
       const wbFatura = await readWorkbook(files.fatura[0]);
-      const wsCte = findFSLSheet(wbFatura, "cte");
-      const wsSellOut = findFSLSheet(wbFatura, "sellout") || findFSLSheet(wbFatura, "sell out");
-      const wsQuiosque = findFSLSheet(wbFatura, "quiosque");
-      if (!wsCte && !wsSellOut && !wsQuiosque) {
+      const wsCte = findFSLSheet(wbFatura, ["cte"]);
+      const wsSellOut = findFSLSheet(wbFatura, ["sellout", "sell out"]);
+      // Fatura real: uma aba de quiosque POR ESTADO ("Abastecimento RJ",
+      // "Abastecimento MG"), não uma única aba "Quiosques". Junta todas.
+      const wsQuiosqueList = findFSLSheets(wbFatura, ["quiosque", "abastec"]);
+      if (!wsCte && !wsSellOut && !wsQuiosqueList.length) {
         throw new Error(`Não reconheci nenhuma aba de CTE/SellOut/Quiosque no arquivo enviado. Abas encontradas: ${wbFatura.SheetNames.join(", ")}. Confirme se é o Relatório FSL original (sem renomear abas).`);
       }
 
-      const tabelaFrete = await loadFslFreightTable(files.tabelaFrete[0]);
+      const { tabela: tabelaFrete, generalidades, generalidadesLista, generalidadesFaltando, abaGeneralidadesEncontrada } = await loadFslFreightTable(files.tabelaFrete[0]);
+      if (!abaGeneralidadesEncontrada) {
+        warnings.push('Tabela de frete FSL: aba "Generalidades" não encontrada. Pedágio, Mínimo GRIS, TAS, Taxa de Despacho, % Reentrega e Mínimo Reentrega ficam todos sem valor — as linhas que dependem deles ficam "AVALIAR" (não foi possível validar), mas o restante da fatura é validado normalmente.');
+      } else if (generalidadesFaltando.length) {
+        const nomes = generalidadesFaltando.map((k) => FSL_GENERALIDADES_LABEL[k] || k).join(", ");
+        warnings.push(`Tabela de frete FSL: a aba "Generalidades" não tem valor para: ${nomes}. Confira a coluna "Chave" (coluna A) — não pode ficar vazia nem mudar de texto nessas linhas. Até corrigir, as linhas que dependem desses valores ficam "AVALIAR" (não foi possível validar); o restante da fatura segue sendo validado normalmente.`);
+      }
 
       // ---- SAP (opcional) ----
       const hasSapSaida = !!(files.sapSaida && files.sapSaida.length);
@@ -2398,17 +3165,19 @@ https://github.com/nodeca/pako/blob/main/LICENSE
       if (hasSapSaida) {
         for (const f of files.sapSaida) {
           const wb = await readWorkbook(f);
-          const ws = pickSheet(wb, ["Sheet"]);
-          const rows = sheetToRows(ws);
-          if (!rows.length) continue;
-          const idx = indexMap(rows[0]);
-          if (!("Serial do Documento" in idx)) { warnings.push(`Base SAP saída "${f.name}": coluna 'Serial do Documento' não encontrada — ignorada.`); continue; }
-          for (const r of rows.slice(1)) {
-            const s = normalizeCnpj(r[idx["Serial do Documento"]]) ? String(Math.trunc(Number(r[idx["Serial do Documento"]]) || 0)) : null;
-            const raw = r[idx["Serial do Documento"]];
-            if (raw === null || raw === undefined || raw === "") continue;
-            sapSaidaSerials.add(String(Math.trunc(Number(raw))));
+          // O nome padrão (fsl_lib.py) é "Serial do Documento", mas a
+          // extração real às vezes vem só "Serial" — aceita as duas (Kate,
+          // 03/09/2026: "na base do SAP a NF fica na coluna 'Serial'").
+          // Procura em TODAS as abas e nas primeiras linhas de cada uma
+          // (não só a aba "Sheet" / linha 1) — exportações reais variam.
+          const achado = localizarTabelaComColuna(wb, ["Serial do Documento", "Serial"]);
+          if (!achado) { warnings.push(`Base SAP saída "${f.name}": não encontrei a coluna 'Serial do Documento' (nem 'Serial') em nenhuma aba (procurei nas primeiras 15 linhas de cada uma). Abas do arquivo: ${wb.SheetNames.join(", ")}. Arquivo ignorado — confirme se é a exportação certa.`); continue; }
+          let carregados = 0;
+          for (const r of achado.dataRows) {
+            const n = normalizeNFKey(r[achado.colIdx]);
+            if (n) { sapSaidaSerials.add(n); carregados++; }
           }
+          notes.push(`Base SAP saída "${f.name}": ${carregados} serial(is) carregado(s) da aba "${achado.sheetName}" (cabeçalho encontrado na linha ${achado.headerRowIdx + 1} do arquivo). Se uma NF que você sabe que está aí ainda aparecer como "não localizada", confira se o valor na planilha não tem algo além dos dígitos do número (a comparação ignora tudo que não é dígito e zeros à esquerda).`);
         }
       } else {
         warnings.push("Base SAP de saída não enviada — o cruzamento documental de Outbound/Transferência não foi feito.");
@@ -2416,97 +3185,170 @@ https://github.com/nodeca/pako/blob/main/LICENSE
       if (hasSapEntrada) {
         for (const f of files.sapEntrada) {
           const wb = await readWorkbook(f);
-          const ws = pickSheet(wb, ["Sheet"]);
-          const rows = sheetToRows(ws);
-          if (!rows.length) continue;
-          const idx = indexMap(rows[0]);
-          if (!("Serial" in idx)) { warnings.push(`Base SAP entrada "${f.name}": coluna 'Serial' não encontrada — ignorada.`); continue; }
-          const modeloIdx = idx["Modelo"];
+          const achado = localizarTabelaComColuna(wb, ["Serial", "Serial do Documento"]);
+          if (!achado) { warnings.push(`Base SAP entrada "${f.name}": não encontrei a coluna 'Serial' (nem 'Serial do Documento') em nenhuma aba (procurei nas primeiras 15 linhas de cada uma). Abas do arquivo: ${wb.SheetNames.join(", ")}. Arquivo ignorado.`); continue; }
+          const modeloIdx = findColumnIdx(achado.idx, ["Modelo", "Modelo Fiscal"]);
           let modelo55Count = 0, total = 0;
-          for (const r of rows.slice(1)) {
+          for (const r of achado.dataRows) {
             total++;
             if (modeloIdx !== undefined && String(r[modeloIdx] || "").trim() !== "55") continue;
             modelo55Count++;
-            const raw = r[idx["Serial"]];
-            if (raw === null || raw === undefined || raw === "") continue;
-            sapEntradaSerials.add(String(Math.trunc(Number(raw))));
+            const n = normalizeNFKey(r[achado.colIdx]);
+            if (n) sapEntradaSerials.add(n);
           }
           if (total > 0 && modelo55Count === 0) {
             warnings.push(`Base SAP entrada "${f.name}": nenhum registro de modelo 55 (NF-e) — provável reextração errada no TaxPlus (só CT-e). Não conte as NFs desta filial como "não lançadas" (armadilhas.md item 11).`);
           }
+          notes.push(`Base SAP entrada "${f.name}": ${modelo55Count} serial(is) modelo 55 carregado(s) de ${total} linha(s), da aba "${achado.sheetName}" (cabeçalho na linha ${achado.headerRowIdx + 1} do arquivo).`);
         }
       } else {
         warnings.push("Base SAP de entrada não enviada — o cruzamento documental de Inbound não foi feito.");
       }
 
-      // ---- CTE ----
+      // Cruzamento por NF contra o SAP — reaproveitado por CTE, Sell Out e
+      // Quiosques. Casa SÓ pelo número da NF (nunca por CT-e, que tem
+      // numeração própria e pode coincidir por acaso com uma NF — mesma
+      // armadilha do "Número Manual" vs "Serial do Documento").
+      function statusSapSaida(nf) {
+        if (!hasSapSaida) return "SEM_BASE";
+        const candidatos = expandirNFs(nf);
+        if (!candidatos.length) return "SEM_NF";
+        return candidatos.some((n) => sapSaidaSerials.has(n)) ? "OK" : "NAO_LOCALIZADA";
+      }
+      function statusSapEntrada(nf) {
+        if (!hasSapEntrada) return "SEM_BASE";
+        const candidatos = expandirNFs(nf);
+        if (!candidatos.length) return "SEM_NF";
+        return candidatos.some((n) => sapEntradaSerials.has(n)) ? "OK" : "NAO_LANCADA";
+      }
+
+      // ---- CTE ---- (valor esperado agora vem da tabela de frete, não de %
+      // por grupo — ver classificarLinhaCTE acima)
       const cteRows = [];
       if (wsCte) {
-        const { rows } = parseFSLAba(wsCte, "CTE", true);
-        for (const row of rows) {
-          const cls = classificarCTE(row, params);
-          const desvio = cls.valorEsperado !== null ? round2(row.freteTotal - cls.valorEsperado) : null;
-          let situacao;
-          if (cls.valorEsperado === null) situacao = "AVALIAR";
-          else situacao = Math.abs(desvio) <= 0.02 * cls.valorEsperado + 0.5 ? "OK" : (desvio > 0 ? "ACIMA" : "ABAIXO");
-          let statusSap = null;
-          if (cls.grupo === "Outbound" || cls.grupo.startsWith("Transferência") || cls.grupo.startsWith("Cross-docking")) {
-            statusSap = hasSapSaida ? (row.nf && sapSaidaSerials.has(String(Math.trunc(Number(row.nf) || 0))) ? "OK" : "NAO_LOCALIZADA") : "SEM_BASE";
-          } else if (cls.grupo === "Inbound") {
-            statusSap = hasSapEntrada ? (row.nf && sapEntradaSerials.has(String(Math.trunc(Number(row.nf) || 0))) ? "OK" : "NAO_LANCADA") : "SEM_BASE";
+        const { rows, naoEncontrados } = parseFSLAba(wsCte, "CTE", true);
+        if (naoEncontrados.includes("NF")) {
+          warnings.push(`Aba de CTE: não encontrei uma coluna de número de NF (tentei "NF", "Nota Fiscal", "NF-e" e variações) — o cruzamento com o SAP nesta aba fica marcado como "SEM_NF" em vez de tentar casar por outro campo (casar por CT-e daria falso positivo/negativo, como o item 1 de armadilhas.md). Me diga o nome exato dessa coluna na fatura para eu ajustar.`);
+        }
+        // Frete original por NF — só linhas "Normal" (nunca Complementar/
+        // Reentrega/Devolução, que não são frete original de ninguém) —
+        // usado para validar TDE (% sobre o frete original) nas linhas
+        // Complementar. Se a mesma NF aparecer em mais de uma linha Normal,
+        // soma (caso raro de nota dividida em mais de um CT-e).
+        const freteOriginalPorNF = new Map();
+        for (const r of rows) {
+          const tN = normalizeText(r.tipo);
+          if (tN.includes("complement") || tN.includes("reentreg") || tN.includes("devol")) continue;
+          for (const nf of expandirNFs(r.nf)) {
+            freteOriginalPorNF.set(nf, (freteOriginalPorNF.get(nf) || 0) + (r.freteTotal || 0));
           }
+        }
+        for (const row of rows) {
+          const cls = classificarLinhaCTE(row, tabelaFrete, generalidades, params, generalidadesLista, freteOriginalPorNF);
+          const desvio = cls.esperado !== null ? round2(row.freteTotal - cls.esperado) : null;
+          const tol = params.toleranciaArredondamento || 1;
+          let situacao;
+          if (cls.esperado === null) situacao = "AVALIAR";
+          else situacao = Math.abs(desvio) <= tol ? "OK" : (desvio > 0 ? "ACIMA" : "ABAIXO");
+          const direcao = direcaoCTE(row);
+          let statusSap = null;
+          if (direcao === "Outbound" || direcao === "Transferência") statusSap = statusSapSaida(row.nf);
+          else if (direcao === "Inbound") statusSap = statusSapEntrada(row.nf);
+          const comp = cls.componentes;
           cteRows.push({
-            "CT-E": row.cte, Tipo: row.tipo, DataFrete: row.dataFrete,
-            Remetente: row.remetente, Destinatario: row.destinatario, DestUF: row.destUf,
-            CNPJPagador: row.cnpjPagador, ValorNF: round2(row.valorNF), FreteCobrado: round2(row.freteTotal),
-            GrupoTarifario: cls.grupo, PctEsperado: cls.pctEsperado, ValorEsperado: cls.valorEsperado,
-            Desvio: desvio, Situacao: situacao, StatusSAP: statusSap, Observacao: cls.observacao || "",
+            "CT-E": row.cte, NF: row.nf, Tipo: row.tipo, Direcao: direcao, DataFrete: row.dataFrete,
+            Remetente: row.remetente, Destinatario: row.destinatario, DestCidade: row.destCidade, DestUF: row.destUf,
+            CNPJPagador: row.cnpjPagador, Peso: row.peso, ValorNF: round2(row.valorNF), FreteCobrado: round2(row.freteTotal),
+            MetodoCalculo: cls.metodo, FreteEsperado: cls.esperado,
+            Desvio: desvio, Situacao: situacao, StatusSAP: statusSap,
+            FretePesoCobrado: comp?.fretePeso?.cobrado ?? null, FretePesoEsperado: comp?.fretePeso?.esperado ?? null,
+            PedagioCobrado: comp?.pedagio?.cobrado ?? null, PedagioEsperado: comp?.pedagio?.esperado ?? null,
+            AdvCobrado: comp?.adv?.cobrado ?? null, AdvEsperado: comp?.adv?.esperado ?? null,
+            GrisCobrado: comp?.gris?.cobrado ?? null, GrisEsperado: comp?.gris?.esperado ?? null,
+            TasCobrado: comp?.tas?.cobrado ?? null, TasEsperado: comp?.tas?.esperado ?? null,
+            TaxaDespachoCobrado: comp?.taxaDespacho?.cobrado ?? null, TaxaDespachoEsperado: comp?.taxaDespacho?.esperado ?? null,
+            SeguroCobrado: comp?.seguro?.cobrado ?? null, SeguroEsperado: comp?.seguro?.esperado ?? null,
+            SuframaCobrado: comp?.suframa?.cobrado ?? null, SuframaEsperado: comp?.suframa?.esperado ?? null,
+            EntregaCobrado: comp?.entrega?.cobrado ?? null, EntregaEsperado: comp?.entrega?.esperado ?? null,
+            BaseCalculoFatura: row.baseCalculoFatura,
+            ItensDivergentes: resumoItensDivergentes(comp),
+            Observacao: cls.observacao || "",
           });
         }
       } else {
         warnings.push("Aba de CTE (Fretes) não encontrada no relatório enviado.");
       }
 
-      // ---- Sell Out ----
+      // ---- Sell Out ---- (sempre entrega ao cliente final → sempre cruza
+      // contra a base de SAÍDA do SAP, não tem Inbound/Transferência aqui)
       const selloutRows = [];
       if (wsSellOut) {
-        const { rows } = parseFSLAba(wsSellOut, "Sell Out", false);
+        const { rows, naoEncontrados } = parseFSLAba(wsSellOut, "Sell Out", false);
+        if (naoEncontrados.includes("NF")) {
+          warnings.push(`Aba de Sell Out: não encontrei uma coluna de número de NF — o cruzamento com o SAP nesta aba fica marcado como "SEM_NF". Me diga o nome exato dessa coluna na fatura para eu ajustar.`);
+        }
         for (const row of rows) {
-          const calc = calcularSellOutEsperado(row, tabelaFrete, params);
+          const calc = calcularFreteEsperado(row, tabelaFrete, generalidades, params, generalidadesLista);
           const desvio = calc.esperado !== null ? round2(row.freteTotal - calc.esperado) : null;
           const tol = params.toleranciaArredondamento || 1;
           let situacao;
           if (calc.esperado === null) situacao = "REVISAR MANUALMENTE";
           else situacao = Math.abs(desvio) <= tol ? "OK" : (desvio > 0 ? "ACIMA" : "ABAIXO");
+          const compSO = calc.componentes;
           selloutRows.push({
-            "CT-E": row.cte, DataFrete: row.dataFrete, DestCidade: row.destCidade, DestUF: row.destUf,
+            "CT-E": row.cte, NF: row.nf, DataFrete: row.dataFrete, DestCidade: row.destCidade, DestUF: row.destUf,
             Peso: row.peso, ValorNF: round2(row.valorNF), AliqICMS: row.aliqPct,
-            FreteCobrado: round2(row.freteTotal), FreteEsperado: calc.esperado, Desvio: desvio,
-            Situacao: situacao, Observacao: calc.motivo || "",
+            FreteCobrado: round2(row.freteTotal), MetodoCalculo: calc.metodo, FreteEsperado: calc.esperado, Desvio: desvio,
+            Situacao: situacao, StatusSAP: statusSapSaida(row.nf),
+            FretePesoCobrado: compSO?.fretePeso?.cobrado ?? null, FretePesoEsperado: compSO?.fretePeso?.esperado ?? null,
+            PedagioCobrado: compSO?.pedagio?.cobrado ?? null, PedagioEsperado: compSO?.pedagio?.esperado ?? null,
+            AdvCobrado: compSO?.adv?.cobrado ?? null, AdvEsperado: compSO?.adv?.esperado ?? null,
+            GrisCobrado: compSO?.gris?.cobrado ?? null, GrisEsperado: compSO?.gris?.esperado ?? null,
+            TasCobrado: compSO?.tas?.cobrado ?? null, TasEsperado: compSO?.tas?.esperado ?? null,
+            TaxaDespachoCobrado: compSO?.taxaDespacho?.cobrado ?? null, TaxaDespachoEsperado: compSO?.taxaDespacho?.esperado ?? null,
+            SeguroCobrado: compSO?.seguro?.cobrado ?? null, SeguroEsperado: compSO?.seguro?.esperado ?? null,
+            SuframaCobrado: compSO?.suframa?.cobrado ?? null, SuframaEsperado: compSO?.suframa?.esperado ?? null,
+            EntregaCobrado: compSO?.entrega?.cobrado ?? null, EntregaEsperado: compSO?.entrega?.esperado ?? null,
+            BaseCalculoFatura: row.baseCalculoFatura,
+            ItensDivergentes: resumoItensDivergentes(compSO),
+            Observacao: calc.motivo || "",
           });
         }
       } else {
         warnings.push("Aba de Sell Out não encontrada no relatório enviado.");
       }
 
-      // ---- Quiosques ----
+      // ---- Quiosques ---- (declaração de conteúdo nunca existe no SAP —
+      // não entra no cruzamento; as demais são tratadas como saída)
       const quiosqueRows = [];
       const quiosqueTotais = {};
-      if (wsQuiosque) {
-        const { rows } = parseFSLAba(wsQuiosque, "Quiosques", false);
-        for (const row of rows) {
-          const isDC = ehDeclaracaoConteudo(row.nf) || ehDeclaracaoConteudo(row.cte);
-          const uf = String(row.destUf || row.remUf || "").toUpperCase() || "?";
-          const isLancamento = normalizeText(row.tipo).includes("lancamento") || normalizeText(row.classificacaoDescricao || "").includes("lancamento") || normalizeText(row.obs || "").includes("lancamento");
-          const valorConsiderado = row.freteTotal || 0;
-          quiosqueTotais[uf] = (quiosqueTotais[uf] || 0) + valorConsiderado;
-          quiosqueRows.push({
-            "CT-E/DC": row.cte || row.nf, UF: uf, Tipo: isLancamento ? "Lançamento (2x)" : "Padrão",
-            EhDeclaracaoConteudo: isDC ? "sim" : "não", ValorCobrado: round2(valorConsiderado),
-          });
+      if (wsQuiosqueList.length) {
+        for (const { name: nomeAbaQuiosque, ws: wsQuiosque } of wsQuiosqueList) {
+          const { rows, naoEncontrados } = parseFSLAba(wsQuiosque, `Quiosques (${nomeAbaQuiosque})`, false);
+          if (naoEncontrados.includes("NF")) {
+            warnings.push(`Aba "${nomeAbaQuiosque}": não encontrei uma coluna de número de NF — lembre que a declaração de conteúdo (padrão DDMMAAAA) nunca existe no SAP mesmo, então isso só afeta linhas com NF-e real, se houver.`);
+          }
+          for (const row of rows) {
+            // isDC usa os valores CRUS (sem tirar zero à esquerda!) — o
+            // padrão DDMMAAAA depende do zero do dia (ex. dia 07). Só a
+            // conferência contra o SAP (statusSapSaida) usa a versão
+            // normalizada em expandirNFs.
+            const nfPartesCru = splitMultiValor(row.nf);
+            const isDC = nfPartesCru.length ? nfPartesCru.every((n) => ehDeclaracaoConteudo(n)) : ehDeclaracaoConteudo(row.cte);
+            const uf = String(row.destUf || row.remUf || "").toUpperCase() || "?";
+            const isLancamento = normalizeText(row.tipo).includes("lancamento") || normalizeText(row.classificacaoDescricao || "").includes("lancamento") || normalizeText(row.obs || "").includes("lancamento");
+            const valorConsiderado = row.freteTotal || 0;
+            quiosqueTotais[uf] = (quiosqueTotais[uf] || 0) + valorConsiderado;
+            quiosqueRows.push({
+              "CT-E/DC": row.cte || row.nf, UF: uf, Tipo: isLancamento ? "Lançamento (2x)" : "Padrão",
+              EhDeclaracaoConteudo: isDC ? "sim" : "não",
+              StatusSAP: isDC ? "N/A (declaração de conteúdo)" : statusSapSaida(row.nf),
+              ValorCobrado: round2(valorConsiderado),
+            });
+          }
         }
       } else {
-        warnings.push("Aba de Quiosques não encontrada no relatório enviado.");
+        warnings.push("Aba de Quiosques não encontrada no relatório enviado (procurei por abas com 'quiosque' ou 'abastec' no nome).");
       }
       const quiosqueEsperadoPorUf = { RJ: params.quiosqueValorRJ, MG: params.quiosqueValorMG };
       const quiosqueResumoRows = Object.keys(quiosqueTotais).map((uf) => {
@@ -2522,35 +3364,87 @@ https://github.com/nodeca/pako/blob/main/LICENSE
 
       // ---- KPIs ----
       const totalCteCobrado = sum(cteRows.map((r) => r.FreteCobrado));
-      const totalCteEsperado = sum(cteRows.filter((r) => r.ValorEsperado !== null).map((r) => r.ValorEsperado));
+      const totalCteEsperado = sum(cteRows.filter((r) => r.FreteEsperado !== null).map((r) => r.FreteEsperado));
       const cteOk = cteRows.filter((r) => r.Situacao === "OK").length;
       const cteAcima = cteRows.filter((r) => r.Situacao === "ACIMA").length;
+      const cteAvaliar = cteRows.filter((r) => r.Situacao === "AVALIAR").length;
       const totalSelloutCobrado = sum(selloutRows.map((r) => r.FreteCobrado));
       const totalSelloutEsperado = sum(selloutRows.filter((r) => r.FreteEsperado !== null).map((r) => r.FreteEsperado));
       const selloutRevisar = selloutRows.filter((r) => r.Situacao === "REVISAR MANUALMENTE").length;
       const totalQuiosques = sum(Object.values(quiosqueTotais));
 
+      // NF x SAP combinado — todas as três abas, porque a Kate pediu que
+      // toda nota (CTE, Sell Out, Quiosques) exista no SAP, não só CTE.
+      const todasComSap = [...cteRows.map((r) => r.StatusSAP), ...selloutRows.map((r) => r.StatusSAP), ...quiosqueRows.map((r) => r.StatusSAP)];
+      const naoLocalizadas = todasComSap.filter((s) => s === "NAO_LOCALIZADA" || s === "NAO_LANCADA").length;
+      const semNf = todasComSap.filter((s) => s === "SEM_NF").length;
+      const localizadas = todasComSap.filter((s) => s === "OK").length;
+      const totalComSapAvaliavel = todasComSap.filter((s) => s === "OK" || s === "NAO_LOCALIZADA" || s === "NAO_LANCADA").length;
+
       const kpis = [
         { label: "Fretes CTE — total cobrado", value: fmtMoney(totalCteCobrado), tone: "neutral", desc: "Soma da coluna FreteCobrado da aba CTE - Análise.", group: "Fretes CTE" },
-        { label: "Fretes CTE — total esperado", value: fmtMoney(totalCteEsperado), tone: "neutral", desc: "Soma do valor esperado (só linhas classificáveis automaticamente).", group: "Fretes CTE" },
+        { label: "Fretes CTE — total esperado", value: fmtMoney(totalCteEsperado), tone: "neutral", desc: "Soma do valor esperado pela tabela de frete (ou pelo % da 4 Elos, quando aplicável) — só linhas com CT-e original localizado/classificável.", group: "Fretes CTE" },
         { label: "Fretes CTE — desvio", value: fmtMoney(totalCteCobrado - totalCteEsperado), tone: Math.abs(totalCteCobrado - totalCteEsperado) > 1 ? "warning" : "good", desc: "Cobrado − esperado, só das linhas classificáveis.", group: "Fretes CTE" },
-        { label: "CT-E dentro do % combinado", value: `${cteOk}/${cteRows.length}`, tone: cteAcima ? "warning" : "good", desc: "Quantidade de linhas cujo desvio ficou dentro da tolerância de 2%.", group: "Fretes CTE" },
+        { label: "CT-E dentro da tolerância", value: `${cteOk}/${cteRows.length}`, tone: cteAcima ? "warning" : "good", desc: "Quantidade de linhas cujo desvio ficou dentro da tolerância de arredondamento definida nos Parâmetros.", group: "Fretes CTE" },
+        { label: "CT-E a avaliar manualmente", value: cteAvaliar, tone: cteAvaliar ? "warning" : "good", desc: "Reentrega/Devolução/Complementar, e os raros casos de CT-e cujo UF tem mais de uma sub-categoria não-capital na tabela (ex.: PA) e o Frete Peso da fatura não bateu com exatamente uma delas — quando o UF só tem capital + 1 outra linha, ou quando o Frete Peso resolve sozinho, o CT-e já é validado normalmente (ver Observação da linha), não entra aqui.", group: "Fretes CTE" },
         { label: "Sell Out — total cobrado", value: fmtMoney(totalSelloutCobrado), tone: "neutral", desc: "Soma da coluna FreteCobrado da aba Sell Out - Análise.", group: "Sell Out" },
         { label: "Sell Out — total esperado", value: fmtMoney(totalSelloutEsperado), tone: "neutral", desc: "Soma do frete recalculado pela tabela — só linhas classificáveis (capital).", group: "Sell Out" },
         { label: "Sell Out — requer classificação manual", value: selloutRevisar, tone: selloutRevisar ? "warning" : "good", desc: "CT-e cujo destino não é a capital do estado — a tabela nova tem sub-categorias de interior sem mapa de cidade->categoria disponível.", group: "Sell Out" },
         { label: "Quiosques — total cobrado", value: fmtMoney(totalQuiosques), tone: "neutral", desc: "Soma de todos os CT-e/DC de quiosque no relatório, por UF.", group: "Quiosques" },
+        { label: "NF localizadas no SAP", value: totalComSapAvaliavel ? `${localizadas}/${totalComSapAvaliavel}` : "—", tone: naoLocalizadas ? "warning" : "good", desc: "Soma das 3 abas (CTE + Sell Out + Quiosques, excluindo declaração de conteúdo de quiosque, que nunca existe no SAP) — quantas NFs cobradas foram encontradas na base SAP enviada.", group: "Conferência SAP" },
+        { label: "NF não localizadas/lançadas no SAP", value: naoLocalizadas, tone: naoLocalizadas ? "critical" : "good", desc: "NF cobrada pela FSL (em qualquer das 3 abas) que não foi encontrada na base SAP enviada — sem documento, o frete não se aprova (ver 'Situação: Saída não localizada' na skill).", group: "Conferência SAP" },
+        { label: "Linhas sem NF para cruzar", value: semNf, tone: semNf ? "warning" : "good", desc: "Linhas em que não havia um número de NF para tentar casar com o SAP (célula vazia, ou a coluna de NF não foi reconhecida na fatura — ver aviso acima).", group: "Conferência SAP" },
       ];
 
-      notes.push("Esta é a primeira versão do módulo FSL. Duas frentes precisam de uma fatura real para fechar: (1) a aba de Quiosques ainda não teve o layout de colunas confirmado; (2) o Sell Out só classifica automaticamente CT-e com destino na capital do estado — os demais aparecem como 'REVISAR MANUALMENTE'. Envie um Relatório CTE real (3 abas) para ajustarmos.");
+      notes.push("O valor esperado de Fretes CTE e Sell Out vem integralmente da tabela de frete nova (mesma fórmula nas duas abas), exceto a exceção da 4 Elos (CNPJ pagador RJ) — os % antigos por grupo tarifário (Cross-docking, Inbound, Outbound, Transferência, Estado do RJ) não são mais usados.");
+      notes.push("O cruzamento com o SAP agora cobre as 3 abas (CTE, Sell Out e Quiosques), sempre casando pelo número da NF (nunca pelo CT-e) — ver a coluna StatusSAP em cada aba e o grupo 'Conferência SAP' nos indicadores.");
+      notes.push("CT-e (CTE ou Sell Out) com destino fora da capital do estado são validados pela linha não-capital daquele UF na tabela (Kate, 10/09/2026). Na tabela atual isso é direto pra quase todo UF, que só tem capital + 1 outra linha — a coluna 'Observação' de cada linha registra qual linha da tabela foi usada, só como auditoria, não como ressalva. Só cai em 'REVISAR MANUALMENTE'/'AVALIAR' o caso raro de UF com 2+ linhas não-capital (ex.: PA) cujo Frete Peso da fatura não bateu com exatamente uma delas.");
+      notes.push('Cada custo cobrado na fatura (Frete Peso, Pedágio, ADV, GRIS, TAS, Seguro, SUFRAMA, Taxa de Despacho, e Entrega quando cobrada) agora é conferido separadamente contra a tabela FSL — não só o Frete Total agregado (Kate, 04/09/2026: "cruzamento coluna por coluna", "valide taxa com a tabela da FSL, até mesmo as generalidades"). Ver as colunas "...Cobrado"/"...Esperado" e a coluna "ItensDivergentes" (lista qual custo não bateu e por quanto) nas abas CTE e Sell Out. Quando a fatura não tem a coluna daquele custo, ele fica "—" (não verificável) em vez de forçar um resultado. Notas 4 Elos (CNPJ pagador RJ + "4 ELOS" no nome) não têm essa quebra: usam só o percentual sobre a NF, não a tabela por Frete Peso.');
+      notes.push('O valor esperado de cada linha agora reconcilia com o FRETE TOTAL da fatura via gross-up de 3 impostos — ICMS (coluna "ALIQ %" da própria linha) + PIS + COFINS —, não só ICMS como antes. PIS (1,65%) e COFINS (7,60%) não constam em nenhuma coluna da fatura nem da tabela FSL: foram inferidos batendo a aritmética de CT-es reais (Fiscal/Base de cálculo = soma dos componentes ÷ (1 − ICMS% − PIS% − COFINS%), consistente em todas as linhas testadas) — ainda NÃO confirmados oficialmente com a FSL/fiscal, editáveis no painel de Parâmetros. A coluna "BaseCalculoFatura" mostra o valor que a própria FSL declarou, para conferência visual contra o "FreteEsperado" calculado aqui.');
       if (params.advMinimo === 0) {
         notes.push("O mínimo de Advalorem está zerado nos parâmetros porque a tabela nova não traz esse valor explicitamente (era R$5,20 na tabela anterior). Confirme com a FSL e ajuste no painel de Parâmetros se ainda valer.");
       }
 
+      // ---- SUFRAMA fora do AM — regra passada por escrito pela Kate
+      // (04/09/2026): "Suframa só tem em Manaus/AM, já é um valor indevido
+      // se constar em outra UF". Cheque explícito, além da comparação
+      // componente a componente acima, porque é um achado alto valor/baixo
+      // esforço de contestar (basta o CNPJ da FSL não conseguir provar que a
+      // entrega foi para o AM).
+      const todasLinhasFSL = [...cteRows, ...selloutRows];
+      const suframaForaDoAM = todasLinhasFSL.filter((r) => r.SuframaCobrado && Math.abs(r.SuframaCobrado) > 0.01 && String(r.DestUF || "").trim().toUpperCase() !== "AM");
+      if (suframaForaDoAM.length > 0) {
+        const totalSuframaIndevido = round2(sum(suframaForaDoAM.map((r) => r.SuframaCobrado)));
+        warnings.push(`SUFRAMA cobrado fora do Amazonas em ${suframaForaDoAM.length} linha(s) — total ${fmtMoney(totalSuframaIndevido)} — a Taxa de Administração do SUFRAMA só existe para entregas em Manaus/AM (regra confirmada com você, 04/09/2026). Ver a coluna "SuframaCobrado" (Esperado = R$0 fora do AM) e "ItensDivergentes" nas abas CTE e Sell Out para a lista completa de NFs.`);
+      }
+
+      // ---- ENTREGA — coluna real da fatura (valores como R$550/850/950,
+      // batendo com "Entrega com Veículo Dedicado" das Generalidades por
+      // faixa de veículo). Regra confirmada pela Kate (10/09/2026): é uma
+      // cobrança legítima em Complementares e em algumas entregas normais,
+      // quando há necessidade de agendamento pela FSL — não dá pra saber
+      // pela fatura QUANDO isso ocorre, então não exigimos em toda linha;
+      // mas quando É cobrada, o validador confere se o valor bate com a
+      // faixa de peso certa da tabela (ver EntregaEsperado/ItensDivergentes)
+      // e ela passa a entrar no FreteEsperado normalmente.
+      const linhasComEntrega = todasLinhasFSL.filter((r) => r.EntregaCobrado && Math.abs(r.EntregaCobrado) > 0.01);
+      if (linhasComEntrega.length > 0) {
+        const totalEntrega = round2(sum(linhasComEntrega.map((r) => r.EntregaCobrado)));
+        const semFaixa = linhasComEntrega.filter((r) => r.EntregaEsperado === null);
+        const divergentes = linhasComEntrega.filter((r) => r.EntregaEsperado !== null && Math.abs((r.EntregaCobrado || 0) - r.EntregaEsperado) > (0.5));
+        let msg = `Coluna "ENTREGA" cobrada em ${linhasComEntrega.length} linha(s) — total ${fmtMoney(totalEntrega)}. Validada contra "Entrega com Veículo Dedicado" (Generalidades) pela faixa de peso de cada linha — cobrança legítima quando a FSL precisou agendar a entrega (Kate, 10/09/2026), por isso não é exigida em toda linha, mas agora entra no Frete Esperado sempre que cobrada.`;
+        if (divergentes.length > 0) msg += ` ${divergentes.length} linha(s) com o valor de Entrega diferente da faixa de peso esperada — ver "ItensDivergentes".`;
+        if (semFaixa.length > 0) msg += ` ${semFaixa.length} linha(s) não deu pra validar (peso fora de toda faixa conhecida da tabela) — entrou no Frete Esperado pelo valor cobrado, sem checagem.`;
+        warnings.push(msg);
+      }
+
+      const statusSapBadge = (v) => (v === "OK" ? "ok" : v === "SEM_BASE" || v === "SEM_NF" || (typeof v === "string" && v.startsWith("N/A")) ? "neutral" : "bad");
+      const itensDivergentesBadge = (v) => (v === "—" ? "neutral" : v === "" ? "ok" : "bad");
       const tables = {
-        "CTE - Análise": { rows: cteRows, statusCols: { Situacao: (v) => (v === "OK" ? "ok" : v === "ACIMA" ? "bad" : v === "ABAIXO" ? "warn" : "neutral"), StatusSAP: (v) => (v === "OK" ? "ok" : v === "SEM_BASE" ? "neutral" : "bad") } },
-        "Sell Out - Análise": { rows: selloutRows, statusCols: { Situacao: (v) => (v === "OK" ? "ok" : v === "REVISAR MANUALMENTE" ? "warn" : "bad") } },
+        "CTE - Análise": { rows: cteRows, statusCols: { Situacao: (v) => (v === "OK" ? "ok" : v === "ACIMA" ? "bad" : v === "ABAIXO" ? "warn" : "neutral"), StatusSAP: statusSapBadge, ItensDivergentes: itensDivergentesBadge } },
+        "Sell Out - Análise": { rows: selloutRows, statusCols: { Situacao: (v) => (v === "OK" ? "ok" : v === "REVISAR MANUALMENTE" ? "warn" : "bad"), StatusSAP: statusSapBadge, ItensDivergentes: itensDivergentesBadge } },
         "Quiosques - Resumo por UF": { rows: quiosqueResumoRows, statusCols: { Situacao: (v) => (v === "OK" ? "ok" : v.startsWith("ESCOPO") ? "warn" : "bad") } },
-        "Quiosques - Análise": { rows: quiosqueRows, statusCols: {} },
+        "Quiosques - Análise": { rows: quiosqueRows, statusCols: { StatusSAP: statusSapBadge } },
       };
 
       return { kpis, tables, warnings, notes };
@@ -2565,6 +3459,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     transportadoras: TRANSPORTADORAS,
     unilog: UNILOG,
     correios: CORREIOS,
+    correios_sallve: CORREIOS_SALLVE,
     fsl: FSL,
   };
 
@@ -2779,7 +3674,14 @@ https://github.com/nodeca/pako/blob/main/LICENSE
       fileInput.addEventListener("change", (e) => {
         state.filesBySlot[input.key] = Array.from(e.target.files || []);
         const fl = item.querySelector(`[data-filelist="${input.key}"]`);
-        fl.textContent = state.filesBySlot[input.key].map((f) => f.name).join(", ");
+        const arquivos = state.filesBySlot[input.key];
+        const tamanhoMB = arquivos.reduce((s, f) => s + (f.size || 0), 0) / (1024 * 1024);
+        // Aviso PREVENTIVO de arquivo grande (Kate, 04/09/2026: "o validador
+        // não está rodando" — era base SAP grande travando o navegador por
+        // dezenas de segundos, não um erro). Avisa já aqui, antes de clicar
+        // em Executar, pra não parecer que travou sem explicação nenhuma.
+        const avisoTamanho = tamanhoMB > 15 ? ` ⚠️ ${tamanhoMB.toFixed(0)}MB — o processamento pode demorar bastante e o navegador pode parecer travado (é normal).` : "";
+        fl.textContent = arquivos.map((f) => f.name).join(", ") + avisoTamanho;
         updateRunEnabled();
       });
     }
@@ -2820,10 +3722,31 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     statusLine.textContent = "Limpo — pronto para uma nova análise.";
   }
 
+  // Kate, 04/09/2026: "o validador não está rodando" — reproduzido com os
+  // arquivos reais dela: bases SAP grandes (dezenas de MB, formato .xls
+  // antigo inclusive) fazem o XLSX.read() do SheetJS travar a thread
+  // principal do navegador por dezenas de segundos (até ~1 minuto com várias
+  // bases grandes juntas) — o processamento TERMINA, só demora muito e o
+  // Chrome pode chegar a mostrar "página não está respondendo". Sem esse
+  // yield antes de chamar validate(), o texto "Processando..." abaixo nem
+  // chegava a pintar na tela antes do travamento, então parecia que nada
+  // tinha acontecido. Não dá pra paralelizar isso num Web Worker sem
+  // reestruturar o arquivo único; o yield aqui é o mínimo pra pelo menos
+  // confirmar visualmente que o processamento começou.
+  function yieldToUI() {
+    return new Promise((resolve) => requestAnimationFrame(() => setTimeout(resolve, 0)));
+  }
+
   async function runValidation() {
     errorBox.innerHTML = "";
-    statusLine.textContent = "Processando arquivos no navegador...";
+    const tamanhoTotalMB = Object.values(state.filesBySlot)
+      .flat()
+      .reduce((soma, f) => soma + (f && f.size ? f.size : 0), 0) / (1024 * 1024);
+    statusLine.textContent = tamanhoTotalMB > 15
+      ? `Processando arquivos no navegador (${tamanhoTotalMB.toFixed(0)}MB no total)... isso pode levar mais de um minuto com arquivos grandes, e o navegador pode parecer travado ("não está respondendo") — é normal, não feche a aba nem clique de novo.`
+      : "Processando arquivos no navegador...";
     runBtn.disabled = true;
+    await yieldToUI(); // deixa o texto acima realmente pintar na tela antes do processamento pesado (síncrono) começar
     try {
       const result = await state.supplier.validate(state.filesBySlot);
       state.result = result;
@@ -3081,3 +4004,5 @@ https://github.com/nodeca/pako/blob/main/LICENSE
 })();
 
 </script>
+</body>
+</html>
