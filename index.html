@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+a<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
 <meta charset="UTF-8">
@@ -2486,18 +2486,10 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     label: "Parâmetros FSL — edite livremente, fica salvo neste navegador",
     groups: [
       {
-        title: "Quiosques — valor por data de abastecimento",
+        title: "Quiosques — valor mensal acordado",
         fields: [
-          // Kate, 19/09/2026, 2ª correção: "acho que dessa forma o sistema
-          // não conseguiu entender o raciocínio no cálculo. Então, vamos
-          // ajustar para cada datas iguais de abastecimento o valor da soma
-          // de cada data deve ser 942,44" — não é um valor semanal/quinzenal
-          // agregado: é o valor esperado para CADA DATA de abastecimento
-          // (pode haver um ou mais CT-e/DC na mesma data; a soma deles
-          // naquela data é que precisa bater com 942,44). Ver agrupamento
-          // por (UF, data) logo abaixo, em vez do total do período.
-          { key: "quiosqueValorRJ", label: "Quiosques RJ (R$ por data de abastecimento)", default: 942.44, source: "Passado por escrito (Kate, 19/09/2026) — comparado contra a soma cobrada em cada data de abastecimento (agrupando os CT-e/DC daquela data), não contra o total do período" },
-          { key: "quiosqueValorMG", label: "Quiosques MG (R$ por data de abastecimento)", default: 942.44, source: "Passado por escrito (Kate, 19/09/2026) — comparado contra a soma cobrada em cada data de abastecimento (agrupando os CT-e/DC daquela data), não contra o total do período" },
+          { key: "quiosqueValorRJ", label: "Quiosques RJ (R$/mês)", default: 3770, source: "Passado por escrito (ago/2026)" },
+          { key: "quiosqueValorMG", label: "Quiosques MG (R$/mês)", default: 3770, source: "Passado por escrito (ago/2026)" },
         ],
       },
       {
@@ -2509,31 +2501,23 @@ https://github.com/nodeca/pako/blob/main/LICENSE
       {
         title: "Ajustes do validador (não vêm da FSL)",
         fields: [
+          { key: "advMinimo", label: "Mínimo Advalorem (R$/CT-e) — NÃO CONFIRMADO", default: 0, source: "Não consta na tabela nova; era R$5,20 — confirmar com a FSL" },
           { key: "toleranciaArredondamento", label: "Tolerância de arredondamento (R$)", default: 0.5, source: "Critério interno — armadilhas.md item 10 (reduzida de R$1,00 para R$0,50 a pedido da Kate, 10/09/2026: \"a FSL não tem tolerância de 2%, precisa ser o custo preciso conforme tabela de fretes\")" },
+          // PIS/COFINS não constam na tabela de frete da FSL (só ICMS, coluna
+          // "ALIQ %" da própria fatura) — descobertos batendo a aritmética de
+          // CT-es reais da fatura BTC Q2/ago-26 (Kate, 04/09/2026: "cruzamento
+          // coluna por coluna para chegar no FRETE TOTAL"): em toda linha
+          // testada, Fiscal/Base de cálculo = (soma de todos os componentes
+          // cobrados) ÷ (1 − ALIQ% − 1,65% − 7,60%), sempre com essas duas
+          // taxas fixas. Editável aqui só até confirmar oficialmente com a
+          // FSL/fiscal — não é um valor que a FSL declara em lugar nenhum da
+          // fatura ou da tabela.
+          { key: "pisPct", label: "PIS no gross-up do Frete Total (%) — NÃO CONFIRMADO", default: 1.65, source: "Não consta na fatura nem na tabela da FSL — inferido batendo a aritmética de faturas reais (04/09/2026). Confirmar com a FSL/fiscal." },
+          { key: "cofinsPct", label: "COFINS no gross-up do Frete Total (%) — NÃO CONFIRMADO", default: 7.60, source: "Mesma origem do PIS acima — inferido, não confirmado oficialmente com a FSL." },
         ],
       },
     ],
   };
-  // Mínimo de Advalorem, PIS e COFINS (gross-up do Frete Total) deixaram de
-  // ser parâmetros editáveis (Kate, 19/09/2026: "vc pode excluir do sistema
-  // esses Ajustes do validador (não vêm da FSL) e manter apenas o Tolerância
-  // de arredondamento. Pois os demais valores vc deve comparar entre a
-  // fatura x tabela de frete") — ficam fixos no código, com o mesmo valor que
-  // já era o default:
-  // - FSL_ADV_MINIMO: a tabela nova não traz mínimo de Advalorem explícito
-  //   (era R$5,20 na tabela anterior); fica em R$0 até a FSL confirmar um
-  //   valor novo.
-  // - FSL_PIS_PCT / FSL_COFINS_PCT: não constam na tabela de frete da FSL
-  //   (só ICMS, coluna "ALIQ %" da própria fatura) — descobertos batendo a
-  //   aritmética de CT-es reais da fatura BTC Q2/ago-26 (Kate, 04/09/2026:
-  //   "cruzamento coluna por coluna para chegar no FRETE TOTAL"): em toda
-  //   linha testada, Fiscal/Base de cálculo = (soma de todos os componentes
-  //   cobrados) ÷ (1 − ALIQ% − 1,65% − 7,60%), sempre com essas duas taxas
-  //   fixas. Ainda NÃO confirmado oficialmente com a FSL/fiscal — se a FSL
-  //   confirmar um valor diferente, atualize as constantes abaixo.
-  const FSL_ADV_MINIMO = 0;
-  const FSL_PIS_PCT = 1.65;
-  const FSL_COFINS_PCT = 7.6;
   // Pedágio, mínimo GRIS, TAS, Taxa de Despacho, % de Reentrega e mínimo de
   // Reentrega são taxas da FSL — em vez de duplicá-las aqui, o validador lê
   // direto da aba "Generalidades" da tabela de frete carregada a cada
@@ -2964,7 +2948,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     // própria tabela de frete carregada — só o mínimo de Advalorem (não
     // informado pela FSL nesta tabela) fica no painel de Parâmetros.
     const pedagio = (generalidades.pedagioPorFracao100kg || 0) * Math.ceil(peso / 100 || 0);
-    const adv = Math.max(FSL_ADV_MINIMO, (row.valorNF || 0) * (entry.advPct / 100));
+    const adv = Math.max(params.advMinimo || 0, (row.valorNF || 0) * (entry.advPct / 100));
     const gris = Math.max(generalidades.grisMinimo || 0, (row.valorNF || 0) * (entry.grisPct / 100));
     const tas = generalidades.tasPorCte || 0;
     const taxaDespacho = generalidades.taxaDespachoPorCte || 0;
@@ -2990,8 +2974,8 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     // sistematicamente abaixo do Frete Total cobrado em toda fatura real
     // testada.
     const aliqIcms = (row.aliqPct || 0) / 100;
-    const aliqPis = FSL_PIS_PCT / 100;
-    const aliqCofins = FSL_COFINS_PCT / 100;
+    const aliqPis = (params.pisPct || 0) / 100;
+    const aliqCofins = (params.cofinsPct || 0) / 100;
     const aliqTotal = aliqIcms + aliqPis + aliqCofins;
     const total = aliqTotal < 1 ? subtotal / (1 - aliqTotal) : subtotal;
     // Confere CADA componente cobrado na própria fatura (quando a coluna
@@ -3415,14 +3399,8 @@ https://github.com/nodeca/pako/blob/main/LICENSE
 
       // ---- Quiosques ---- (declaração de conteúdo nunca existe no SAP —
       // não entra no cruzamento; as demais são tratadas como saída)
-      // Agrupamento por (UF, DATA de abastecimento): a soma dos CT-e/DC de
-      // uma mesma data precisa bater com o valor acordado daquela UF (Kate,
-      // 19/09/2026 — ver comentário nos parâmetros acima). Usa "DATA FRETE"
-      // (data em que o abastecimento efetivamente ocorreu) e cai para "DATA
-      // CT-E" (emissão) só quando a fatura não trouxer a primeira.
       const quiosqueRows = [];
-      const quiosqueTotais = {}; // por UF (só para o KPI de total geral)
-      const quiosqueGruposPorData = {}; // chave `${uf}|${data}` -> { uf, data, total, qtd }
+      const quiosqueTotais = {};
       if (wsQuiosqueList.length) {
         for (const { name: nomeAbaQuiosque, ws: wsQuiosque } of wsQuiosqueList) {
           const { rows, naoEncontrados } = parseFSLAba(wsQuiosque, `Quiosques (${nomeAbaQuiosque})`, false);
@@ -3439,14 +3417,9 @@ https://github.com/nodeca/pako/blob/main/LICENSE
             const uf = String(row.destUf || row.remUf || "").toUpperCase() || "?";
             const isLancamento = normalizeText(row.tipo).includes("lancamento") || normalizeText(row.classificacaoDescricao || "").includes("lancamento") || normalizeText(row.obs || "").includes("lancamento");
             const valorConsiderado = row.freteTotal || 0;
-            const dataAbastecimento = row.dataFrete || row.dataCte || null;
             quiosqueTotais[uf] = (quiosqueTotais[uf] || 0) + valorConsiderado;
-            const chaveData = `${uf}|${dataAbastecimento || "SEM DATA"}`;
-            if (!quiosqueGruposPorData[chaveData]) quiosqueGruposPorData[chaveData] = { uf, data: dataAbastecimento, total: 0, qtd: 0 };
-            quiosqueGruposPorData[chaveData].total += valorConsiderado;
-            quiosqueGruposPorData[chaveData].qtd += 1;
             quiosqueRows.push({
-              "CT-E/DC": row.cte || row.nf, UF: uf, Data: dataAbastecimento || "sem data na fatura", Tipo: isLancamento ? "Lançamento (2x)" : "Padrão",
+              "CT-E/DC": row.cte || row.nf, UF: uf, Tipo: isLancamento ? "Lançamento (2x)" : "Padrão",
               EhDeclaracaoConteudo: isDC ? "sim" : "não",
               StatusSAP: isDC ? "N/A (declaração de conteúdo)" : statusSapSaida(row.nf),
               ValorCobrado: round2(valorConsiderado),
@@ -3456,20 +3429,17 @@ https://github.com/nodeca/pako/blob/main/LICENSE
       } else {
         warnings.push("Aba de Quiosques não encontrada no relatório enviado (procurei por abas com 'quiosque' ou 'abastec' no nome).");
       }
-      const quiosqueValorPorUf = { RJ: params.quiosqueValorRJ, MG: params.quiosqueValorMG };
-      const quiosqueResumoRows = Object.values(quiosqueGruposPorData)
-        .sort((a, b) => (a.uf === b.uf ? String(a.data).localeCompare(String(b.data)) : a.uf.localeCompare(b.uf)))
-        .map((g) => {
-          const esperado = quiosqueValorPorUf[g.uf];
-          const cobrado = round2(g.total);
-          const escopoNovo = esperado === undefined;
-          return {
-            UF: g.uf, Data: g.data || "sem data na fatura", "CT-e/DC nesta data": g.qtd, TotalCobrado: cobrado,
-            ValorAcordadoPorData: esperado !== undefined ? esperado : null,
-            Desvio: esperado !== undefined ? round2(cobrado - esperado) : null,
-            Situacao: escopoNovo ? "ESCOPO NOVO — aprovar/negociar" : (Math.abs(cobrado - esperado) <= 1 ? "OK" : "DIVERGENTE"),
-          };
-        });
+      const quiosqueEsperadoPorUf = { RJ: params.quiosqueValorRJ, MG: params.quiosqueValorMG };
+      const quiosqueResumoRows = Object.keys(quiosqueTotais).map((uf) => {
+        const esperado = quiosqueEsperadoPorUf[uf];
+        const cobrado = round2(quiosqueTotais[uf]);
+        const escopoNovo = esperado === undefined;
+        return {
+          UF: uf, TotalCobrado: cobrado, ValorAcordado: esperado !== undefined ? esperado : null,
+          Desvio: esperado !== undefined ? round2(cobrado - esperado) : null,
+          Situacao: escopoNovo ? "ESCOPO NOVO — aprovar/negociar" : (Math.abs(cobrado - esperado) <= 1 ? "OK" : "DIVERGENTE"),
+        };
+      });
 
       // ---- KPIs ----
       const totalCteCobrado = sum(cteRows.map((r) => r.FreteCobrado));
@@ -3499,36 +3469,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
         { label: "Sell Out — total cobrado", value: fmtMoney(totalSelloutCobrado), tone: "neutral", desc: "Soma da coluna FreteCobrado da aba Sell Out - Análise.", group: "Sell Out" },
         { label: "Sell Out — total esperado", value: fmtMoney(totalSelloutEsperado), tone: "neutral", desc: "Soma do frete recalculado pela tabela — só linhas classificáveis (capital).", group: "Sell Out" },
         { label: "Sell Out — requer classificação manual", value: selloutRevisar, tone: selloutRevisar ? "warning" : "good", desc: "CT-e cujo destino não é a capital do estado — a tabela nova tem sub-categorias de interior sem mapa de cidade->categoria disponível.", group: "Sell Out" },
-        { label: "Quiosques — total cobrado (todos os UFs)", value: fmtMoney(totalQuiosques), tone: "neutral", desc: "Soma de todos os CT-e/DC de quiosque no relatório, somando todos os UFs e todas as datas — ver os indicadores por UF abaixo e a aba \"Quiosques - Resumo por Data\" para o detalhe data a data.", group: "Quiosques" },
-        ...Object.entries(
-          // Agrega as linhas por-data (quiosqueResumoRows) de volta por UF só
-          // para o card-resumo — o detalhe de cada data fica na aba de
-          // exportação, não teria espaço legível pra uma linha por data aqui
-          // se o mês tiver várias entregas.
-          quiosqueResumoRows.reduce((acc, r) => {
-            if (!acc[r.UF]) acc[r.UF] = { ok: 0, divergente: 0, escopoNovo: 0, cobrado: 0, esperado: 0, desvioAbs: 0 };
-            const g = acc[r.UF];
-            g.cobrado += r.TotalCobrado;
-            if (r.Situacao === "OK") g.ok += 1;
-            else if (r.Situacao === "DIVERGENTE") { g.divergente += 1; g.desvioAbs += Math.abs(r.Desvio); }
-            else g.escopoNovo += 1;
-            if (r.ValorAcordadoPorData !== null) g.esperado += r.ValorAcordadoPorData;
-            return acc;
-          }, {})
-        ).map(([uf, g]) => {
-          const totalDatas = g.ok + g.divergente + g.escopoNovo;
-          const todasEscopoNovo = g.escopoNovo === totalDatas;
-          const temDivergencia = g.divergente > 0;
-          return {
-            label: `Quiosques ${uf} — datas de abastecimento`,
-            value: todasEscopoNovo ? `${totalDatas} data(s) — escopo novo` : `${g.ok}/${totalDatas} data(s) OK`,
-            tone: todasEscopoNovo ? "warning" : temDivergencia ? "critical" : "good",
-            desc: todasEscopoNovo
-              ? `${totalDatas} data(s) de abastecimento em ${uf} cobrada(s), mas sem valor acordado nos Parâmetros para essa UF — escopo novo, não é divergência de cobrança: aprove/negocie o valor e cadastre em Parâmetros.`
-              : `Cada data de abastecimento em ${uf} deve somar o valor acordado nos Parâmetros (comparação por data, não por período — Kate, 19/09/2026). Cobrado no total: ${fmtMoney(g.cobrado)}; esperado no total: ${fmtMoney(g.esperado)}.${temDivergencia ? ` ${g.divergente} data(s) fora da tolerância, somando ${fmtMoney(g.desvioAbs)} de desvio.` : ""} Ver a aba "Quiosques - Resumo por Data" para o detalhe de cada data.`,
-            group: "Quiosques",
-          };
-        }),
+        { label: "Quiosques — total cobrado", value: fmtMoney(totalQuiosques), tone: "neutral", desc: "Soma de todos os CT-e/DC de quiosque no relatório, por UF.", group: "Quiosques" },
         { label: "NF localizadas no SAP", value: totalComSapAvaliavel ? `${localizadas}/${totalComSapAvaliavel}` : "—", tone: naoLocalizadas ? "warning" : "good", desc: "Soma das 3 abas (CTE + Sell Out + Quiosques, excluindo declaração de conteúdo de quiosque, que nunca existe no SAP) — quantas NFs cobradas foram encontradas na base SAP enviada.", group: "Conferência SAP" },
         { label: "NF não localizadas/lançadas no SAP", value: naoLocalizadas, tone: naoLocalizadas ? "critical" : "good", desc: "NF cobrada pela FSL (em qualquer das 3 abas) que não foi encontrada na base SAP enviada — sem documento, o frete não se aprova (ver 'Situação: Saída não localizada' na skill).", group: "Conferência SAP" },
         { label: "Linhas sem NF para cruzar", value: semNf, tone: semNf ? "warning" : "good", desc: "Linhas em que não havia um número de NF para tentar casar com o SAP (célula vazia, ou a coluna de NF não foi reconhecida na fatura — ver aviso acima).", group: "Conferência SAP" },
@@ -3538,9 +3479,9 @@ https://github.com/nodeca/pako/blob/main/LICENSE
       notes.push("O cruzamento com o SAP agora cobre as 3 abas (CTE, Sell Out e Quiosques), sempre casando pelo número da NF (nunca pelo CT-e) — ver a coluna StatusSAP em cada aba e o grupo 'Conferência SAP' nos indicadores.");
       notes.push("CT-e (CTE ou Sell Out) com destino fora da capital do estado são validados pela linha não-capital daquele UF na tabela (Kate, 10/09/2026). Na tabela atual isso é direto pra quase todo UF, que só tem capital + 1 outra linha — a coluna 'Observação' de cada linha registra qual linha da tabela foi usada, só como auditoria, não como ressalva. Só cai em 'REVISAR MANUALMENTE'/'AVALIAR' o caso raro de UF com 2+ linhas não-capital (ex.: PA) cujo Frete Peso da fatura não bateu com exatamente uma delas.");
       notes.push('Cada custo cobrado na fatura (Frete Peso, Pedágio, ADV, GRIS, TAS, Seguro, SUFRAMA, Taxa de Despacho, e Entrega quando cobrada) agora é conferido separadamente contra a tabela FSL — não só o Frete Total agregado (Kate, 04/09/2026: "cruzamento coluna por coluna", "valide taxa com a tabela da FSL, até mesmo as generalidades"). Ver as colunas "...Cobrado"/"...Esperado" e a coluna "ItensDivergentes" (lista qual custo não bateu e por quanto) nas abas CTE e Sell Out. Quando a fatura não tem a coluna daquele custo, ele fica "—" (não verificável) em vez de forçar um resultado. Notas 4 Elos (CNPJ pagador RJ + "4 ELOS" no nome) não têm essa quebra: usam só o percentual sobre a NF, não a tabela por Frete Peso.');
-      notes.push(`O valor esperado de cada linha agora reconcilia com o FRETE TOTAL da fatura via gross-up de 3 impostos — ICMS (coluna "ALIQ %" da própria linha) + PIS + COFINS —, não só ICMS como antes. PIS (${FSL_PIS_PCT}%) e COFINS (${FSL_COFINS_PCT}%) não constam em nenhuma coluna da fatura nem da tabela FSL: foram inferidos batendo a aritmética de CT-es reais (Fiscal/Base de cálculo = soma dos componentes ÷ (1 − ICMS% − PIS% − COFINS%), consistente em todas as linhas testadas) — ainda NÃO confirmados oficialmente com a FSL/fiscal, fixos no código (não são mais editáveis no painel de Parâmetros — Kate, 19/09/2026). A coluna "BaseCalculoFatura" mostra o valor que a própria FSL declarou, para conferência visual contra o "FreteEsperado" calculado aqui.`);
-      if (FSL_ADV_MINIMO === 0) {
-        notes.push("O mínimo de Advalorem está fixado em R$0 porque a tabela nova não traz esse valor explicitamente (era R$5,20 na tabela anterior). Avise se a FSL confirmar um valor novo para ajustar no código.");
+      notes.push('O valor esperado de cada linha agora reconcilia com o FRETE TOTAL da fatura via gross-up de 3 impostos — ICMS (coluna "ALIQ %" da própria linha) + PIS + COFINS —, não só ICMS como antes. PIS (1,65%) e COFINS (7,60%) não constam em nenhuma coluna da fatura nem da tabela FSL: foram inferidos batendo a aritmética de CT-es reais (Fiscal/Base de cálculo = soma dos componentes ÷ (1 − ICMS% − PIS% − COFINS%), consistente em todas as linhas testadas) — ainda NÃO confirmados oficialmente com a FSL/fiscal, editáveis no painel de Parâmetros. A coluna "BaseCalculoFatura" mostra o valor que a própria FSL declarou, para conferência visual contra o "FreteEsperado" calculado aqui.');
+      if (params.advMinimo === 0) {
+        notes.push("O mínimo de Advalorem está zerado nos parâmetros porque a tabela nova não traz esse valor explicitamente (era R$5,20 na tabela anterior). Confirme com a FSL e ajuste no painel de Parâmetros se ainda valer.");
       }
 
       // ---- SUFRAMA fora do AM — regra passada por escrito pela Kate
@@ -3581,7 +3522,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
       const tables = {
         "CTE - Análise": { rows: cteRows, statusCols: { Situacao: (v) => (v === "OK" ? "ok" : v === "ACIMA" ? "bad" : v === "ABAIXO" ? "warn" : "neutral"), StatusSAP: statusSapBadge, ItensDivergentes: itensDivergentesBadge } },
         "Sell Out - Análise": { rows: selloutRows, statusCols: { Situacao: (v) => (v === "OK" ? "ok" : v === "REVISAR MANUALMENTE" ? "warn" : "bad"), StatusSAP: statusSapBadge, ItensDivergentes: itensDivergentesBadge } },
-        "Quiosques - Resumo por Data": { rows: quiosqueResumoRows, statusCols: { Situacao: (v) => (v === "OK" ? "ok" : v.startsWith("ESCOPO") ? "warn" : "bad") } },
+        "Quiosques - Resumo por UF": { rows: quiosqueResumoRows, statusCols: { Situacao: (v) => (v === "OK" ? "ok" : v.startsWith("ESCOPO") ? "warn" : "bad") } },
         "Quiosques - Análise": { rows: quiosqueRows, statusCols: { StatusSAP: statusSapBadge } },
       };
 
