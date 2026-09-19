@@ -284,6 +284,19 @@ https://github.com/nodeca/pako/blob/main/LICENSE
         try {
           const data = new Uint8Array(e.target.result);
           const wb = XLSX.read(data, { type: "array", cellDates: false, raw: true });
+          // Kate, 19/09/2026: com um export SAP muito grande (base de entrada
+          // Unilog ES, ~280 colunas x milhares de linhas), a biblioteca de
+          // leitura de planilha não consegue processar o XML de uma aba
+          // específica (limite de tamanho de string do motor JS) e, em vez de
+          // dar erro, ela simplesmente OMITE essa aba de wb.Sheets — a aba
+          // continua listada em wb.SheetNames, mas wb.Sheets[nome] fica
+          // undefined, e qualquer busca de coluna nela silenciosamente não
+          // acha nada (parece "coluna não existe" quando na verdade a aba
+          // inteira não foi lida). Marcamos isso aqui pra quem for gerar o
+          // aviso poder dizer a causa real, em vez de "não encontrei a
+          // coluna X".
+          const abasComFalha = wb.SheetNames.filter((n) => !wb.Sheets[n]);
+          if (abasComFalha.length) wb.__abasComFalhaDeLeitura = abasComFalha;
           resolve(wb);
         } catch (err) {
           reject(err);
@@ -292,6 +305,14 @@ https://github.com/nodeca/pako/blob/main/LICENSE
       reader.onerror = () => reject(reader.error);
       reader.readAsArrayBuffer(file);
     });
+  }
+
+  // Mensagem pronta pra anexar a um warning quando uma ou mais abas do
+  // arquivo não puderam ser lidas (ver nota em readWorkbook acima) — usar
+  // sempre que uma busca de coluna nesse workbook não achar o esperado.
+  function avisoAbasComFalhaDeLeitura(wb) {
+    if (!wb.__abasComFalhaDeLeitura || !wb.__abasComFalhaDeLeitura.length) return "";
+    return ` ATENÇÃO: a(s) aba(s) ${wb.__abasComFalhaDeLeitura.map((n) => `"${n}"`).join(", ")} deste arquivo não puderam ser lidas (provavelmente por serem grandes demais — muitas colunas e/ou linhas) e foram ignoradas por completo, mesmo aparecendo na lista de abas. Se os dados que faltaram estavam nelas, peça uma exportação mais enxuta (só as colunas necessárias: Serial/Nº Documento, Chave de acesso, Situação/Descrição situação) — isso deve resolver.`;
   }
 
   function pickSheet(wb, preferredNames) {
@@ -843,7 +864,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
               warnings.push(`Arquivo "${f.name}": ${carregados} registro(s) carregado(s) pelo layout Intelipost (colunas 'Pedido' + 'Nota Fiscal' da aba "${achadoIP.sheetName}", cabeçalho na linha ${achadoIP.headerRowIdx + 1}). (Aviso informativo, não é um erro.)`);
               continue;
             }
-            warnings.push(`Arquivo "${f.name}": não reconheci nem o layout da base SAP (coluna 'Serial'/'Serial do Documento') nem o da Intelipost (colunas 'Pedido' + 'Nota Fiscal' na mesma aba) em nenhuma aba (procurei nas primeiras 15 linhas de cada uma). Abas do arquivo: ${wb.SheetNames.join(", ")}. Arquivo ignorado.`);
+            warnings.push(`Arquivo "${f.name}": não reconheci nem o layout da base SAP (coluna 'Serial'/'Serial do Documento') nem o da Intelipost (colunas 'Pedido' + 'Nota Fiscal' na mesma aba) em nenhuma aba (procurei nas primeiras 15 linhas de cada uma). Abas do arquivo: ${wb.SheetNames.join(", ")}.${avisoAbasComFalhaDeLeitura(wb)} Arquivo ignorado.`);
           }
           if (sapSerials.size === 0 && sapPedidos.size === 0) {
             // Não trava a validação inteira por causa da base de pedidos/notas
@@ -1176,10 +1197,47 @@ https://github.com/nodeca/pako/blob/main/LICENSE
   // MÓDULO: Unilog (armazenagem/fulfillment) — qualquer depositante/unidade
   // ---------------------------------------------------------------------
 
+  // Palavras que, em qualquer combinação de depositante/unidade Unilog,
+  // indicam que o serviço é o recebimento de mercadoria de ENTRADA (a nota
+  // fiscal do fornecedor chegando no CD) — lista extensível, ver comentário
+  // na regra de cruzamento logo abaixo. Comparado sobre texto já normalizado
+  // (normalizeText: minúsculo, sem acento), por isso as chaves aqui também
+  // vêm sem acento.
+  const ENTRADA_PALAVRAS_CHAVE = ["receb", "descarga"];
+
   const CROSSWALK_RULES = [
-    { test: (c) => /RECEBIMENTO/i.test(c), type: "entrada", statusField: "Descrição situação", okValues: ["Documento regular"] },
-    { test: (c) => /OPERA[ÇC][ÃA]O\s*B2B\s*-\s*POR\s*UNIDADE/i.test(c), type: "saida", statusField: "Status", okValues: ["Autorizado"] },
-    { test: (c) => /OPERA[ÇC][ÃA]O\s*B2B\s*-\s*POR\s*VOLUME/i.test(c), type: "saida", statusField: "Status", okValues: ["Autorizado"] },
+    // A redação do serviço de recebimento/entrada muda por depositante/
+    // unidade — não é um texto fixo. Kate, 19/09/2026: na fatura Unilog RJ
+    // vem como "[1] QUANTIDADE DE PALLET RECEBIDO" (não "RECEBIMENTO").
+    // Kate, 19/09/2026 (2ª mensagem): no ES pode vir como "[1] DESCARGA DE
+    // MERCADORIA - POR PALLET" — outra palavra pro mesmo serviço (descarga
+    // = ato de descarregar/receber a mercadoria que chega). Por isso
+    // ENTRADA_PALAVRAS_CHAVE é uma lista, fácil de estender quando aparecer
+    // mais uma variação, em vez de reescrever a regex toda vez. Excluímos
+    // explicitamente logística reversa/devolução, que também fala em
+    // "recebido"/"descarga" às vezes mas é outro serviço (não é o
+    // recebimento de mercadoria de entrada).
+    {
+      test: (c) => {
+        const n = normalizeText(c);
+        return ENTRADA_PALAVRAS_CHAVE.some((kw) => n.includes(kw)) && !/revers|devolu/.test(n);
+      },
+      type: "entrada",
+      statusField: "Descrição situação",
+      okValues: ["Documento regular"],
+    },
+    // Kate, 19/09/2026: "os documentos de saídas não são só os documentos
+    // B2B, são as notas de saída B2B E B2C, tem mais de 5k que ele precisa
+    // validar (isso vale para todas as faturas de SP, ES e RJ)" — antes só
+    // B2B entrava no cruzamento de saída; B2C (que é o maior volume de
+    // longe — só a aba B2C da fatura ES tem mais de 56 mil documentos)
+    // ficava de fora, em "código sem regra". A redação do B2C também varia
+    // por unidade (RJ/ES: "OPERAÇÃO B2C - POR DOCUMENTO"; SP: "OPERAÇÃO B2C
+    // - POR PEDIDO EXPEDIDO"), então casamos por "OPERAÇÃO B2C" simples,
+    // igual já fazíamos por "OPERAÇÃO B2B" (sem travar em "POR
+    // UNIDADE"/"POR VOLUME" — qualquer sufixo depois de B2B/B2C entra).
+    { test: (c) => /OPERA[ÇC][ÃA]O\s*B2B/i.test(c), type: "saida", statusField: "Status", okValues: ["Autorizado"] },
+    { test: (c) => /OPERA[ÇC][ÃA]O\s*B2C/i.test(c), type: "saida", statusField: "Status", okValues: ["Autorizado"] },
   ];
 
   async function parseUnilogFatura(file) {
@@ -1190,16 +1248,33 @@ https://github.com/nodeca/pako/blob/main/LICENSE
       const rows = sheetToRows(wb.Sheets[infoSheetName]);
       for (const r of rows) {
         if (!r || !r[0]) continue;
-        const label = String(r[0]).trim();
-        if (label === "Data Inicial:") info.dataInicial = r[1];
-        if (label === "Data Final:") info.dataFinal = r[1];
-        if (label === "Depositante:") info.depositante = r[1];
-        if (label === "Estabelecimento:") info.estabelecimento = r[1];
+        // Comparação tolerante a acento/caixa (normalizeText) — evita que uma
+        // variação de formatação entre unidades/depositantes (ex.: "Data
+        // Inicial :" com espaço, ou tudo em maiúsculas) quebre a leitura
+        // silenciosamente.
+        const label = normalizeText(r[0]).trim();
+        if (label === "data inicial:") info.dataInicial = r[1];
+        if (label === "data final:") info.dataFinal = r[1];
+        if (label === "depositante:") info.depositante = r[1];
+        if (label === "estabelecimento:") info.estabelecimento = r[1];
       }
     }
 
     const resumoRows = [];
-    const resumoTotals = {}; // apuração / impostos / total a faturar — informational, not service line items
+    // A aba "Resumo de Serviços" pode ter MAIS DE UM bloco de tabela (ex.:
+    // um bloco geral de serviços e outro só de Operação B2B/B2C — Kate,
+    // 19/09/2026, faturas ES e SP), cada um com sua PRÓPRIA linha
+    // "APURAÇÃO" / "IMPOSTOS = X% (ISS) + Y% (PIS/COFINS)" / "TOTAL A
+    // FATURAR". Guardamos um registro POR BLOCO (impostoBlocos) — inclusive
+    // a alíquota de ISS/PIS-COFINS que a própria Unilog escreveu no rótulo
+    // daquele bloco — e só DEPOIS somamos os blocos pra ter o total da
+    // fatura inteira. Antes disso, resumoTotals era sobrescrito a cada
+    // bloco novo (ficava só com os valores do ÚLTIMO bloco), o que fazia o
+    // KPI "Total a faturar (fatura)" mostrar um número bem menor que o
+    // valor real da fatura em qualquer fatura com mais de um bloco.
+    const impostoBlocos = [];
+    let blocoAtual = { apuracao: null, impostos: null, totalFaturar: null, issPctFatura: null, pisCofinsPctFatura: null };
+    const resumoTotals = { apuracao: null, impostos: null, totalFaturar: null }; // somados de todos os blocos
     const resumoSheetName = wb.SheetNames.find((n) => normalizeText(n).includes("resumo de servi"));
     if (resumoSheetName) {
       const rows = sheetToRows(wb.Sheets[resumoSheetName]);
@@ -1208,14 +1283,47 @@ https://github.com/nodeca/pako/blob/main/LICENSE
         for (let i = headerIdx + 1; i < rows.length; i++) {
           const r = rows[i];
           if (!r || !r[1]) continue;
-          // Real service codes always look like "[1] ALGUMA COISA". Anything else
-          // from this point on (APURAÇÃO / IMPOSTOS / TOTAL A FATURAR) is a footer
-          // summary line, not a billable service — stop collecting service rows.
-          if (!/^\[\d+\]/.test(String(r[1]).trim())) {
-            const label = normalizeText(r[1]);
-            if (label.includes("apuracao")) resumoTotals.apuracao = toNum(r[4], null);
-            else if (label.includes("imposto")) resumoTotals.impostos = toNum(r[4], null);
-            else if (label.includes("total a faturar")) resumoTotals.totalFaturar = toNum(r[4], null);
+          // A maioria dos códigos de serviço vem como "[1] ALGUMA COISA", mas
+          // nem todo serviço cobrado segue esse padrão — Kate, 19/09/2026,
+          // fatura SP: linhas de serviço aprovado à parte por e-mail vêm sem
+          // colchete ("Montagem de Kit projeto - RET", com "Tipo de Serviço"
+          // = "Serviço aprovado via e-mail,."), e eram descartadas
+          // silenciosamente por essa função (tratadas como se fossem rodapé
+          // de APURAÇÃO/IMPOSTOS/TOTAL A FATURAR), somindo da contagem de
+          // serviços e do total a faturar sem nenhum aviso. Por isso só
+          // tratamos como rodapé/resumo (e não como serviço) as linhas cujo
+          // texto bate literalmente com apuração/imposto/total a faturar —
+          // qualquer outra linha com um valor na coluna é um serviço de
+          // verdade, com ou sem colchete.
+          const label = normalizeText(r[1]);
+          // Cabeçalho repetido no meio da planilha (início de um novo
+          // bloco) — ignora a linha, o bloco novo começa a ser preenchido
+          // normalmente a partir da próxima linha.
+          if (label === "codigo servico") continue;
+          const ehLinhaResumoRodape = label.includes("apuracao") || label.includes("imposto") || label.includes("total a faturar");
+          if (ehLinhaResumoRodape) {
+            if (label.includes("apuracao")) {
+              blocoAtual.apuracao = toNum(r[4], null);
+            } else if (label.includes("imposto")) {
+              blocoAtual.impostos = toNum(r[4], null);
+              // A própria Unilog escreve a alíquota usada no rótulo, ex.:
+              // "IMPOSTOS = 5% (ISS) + 9,25% (PIS/ COFINS)" — extraímos os
+              // dois percentuais pra comparar com o que a Kate espera
+              // (parâmetros editáveis), em vez de confiar cegamente.
+              const mIss = label.match(/([\d,.]+)\s*%\s*\(iss\)/);
+              const mPisCofins = label.match(/([\d,.]+)\s*%\s*\(pis/);
+              if (mIss) blocoAtual.issPctFatura = parseBR(mIss[1]);
+              if (mPisCofins) blocoAtual.pisCofinsPctFatura = parseBR(mPisCofins[1]);
+            } else if (label.includes("total a faturar")) {
+              blocoAtual.totalFaturar = toNum(r[4], null);
+              // "Total a faturar" fecha o bloco — soma no agregado da
+              // fatura inteira e começa um bloco novo do zero.
+              impostoBlocos.push(blocoAtual);
+              resumoTotals.apuracao = (resumoTotals.apuracao || 0) + (blocoAtual.apuracao || 0);
+              resumoTotals.impostos = (resumoTotals.impostos || 0) + (blocoAtual.impostos || 0);
+              resumoTotals.totalFaturar = (resumoTotals.totalFaturar || 0) + (blocoAtual.totalFaturar || 0);
+              blocoAtual = { apuracao: null, impostos: null, totalFaturar: null, issPctFatura: null, pisCofinsPctFatura: null };
+            }
             continue;
           }
           resumoRows.push({
@@ -1229,30 +1337,61 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     }
 
     const detailSheets = {};
+    // Abas que não bateram nem com "Código:" nem, tendo batido, sem uma
+    // linha "Data Cobrança" — sinalizadas em vez de silenciosamente
+    // ignoradas, porque uma aba de detalhamento não reconhecida é a causa
+    // mais provável de um serviço (ex.: Recebimento) não entrar no
+    // cruzamento com o SAP mesmo com a base carregada corretamente (Kate,
+    // 19/09/2026: "o validador não comparou as notas de entrada/
+    // recebimentos da unilog RJ").
+    const abasSemCodigo = [];
+    const abasSemDataCobranca = [];
     for (const name of wb.SheetNames) {
       if (name === infoSheetName || name === resumoSheetName) continue;
       const rows = sheetToRows(wb.Sheets[name]);
-      const codRow = rows.find((r) => r && r[0] === "Código:");
-      if (!codRow) continue;
+      // Comparação tolerante a acento/caixa/espaço — mesma razão do bloco
+      // "Informações" acima.
+      const codRow = rows.find((r) => r && normalizeText(r[0]).trim() === "codigo:");
+      if (!codRow) { abasSemCodigo.push(name); continue; }
       const codigo = String(codRow[1] || "").trim();
-      const headerIdx = rows.findIndex((r) => r && r[0] === "Data Cobrança");
+      const headerIdx = rows.findIndex((r) => r && normalizeText(r[0]).trim() === "data cobranca");
       const items = [];
       if (headerIdx >= 0) {
+        // Índices das colunas Nº Documento/Quantidade/Valor por NOME (tolerante
+        // a acento/caixa), não por posição fixa — Kate, 19/09/2026: depois dos
+        // ajustes de reconhecimento de aba/RECEB, uma fatura passou a dar
+        // "0/44" em entrada E "0/41" em saída ao mesmo tempo, mesmo com as
+        // bases do SAP corretas (confirmado carregando as bases reais isoladas
+        // — elas casam normalmente quando o Nº Documento bate). Isso aponta
+        // pra unidade/depositante ter inserido ou reordenado uma coluna nesta
+        // tabela de detalhamento nesse período, o que quebraria 100% das
+        // linhas de uma vez (não parcialmente) se a extração dependesse só da
+        // posição. Mantém fallback pra posição histórica (1,2,3) se não achar
+        // pelo nome, pra não regredir faturas antigas sem esses cabeçalhos.
+        const headerRow = rows[headerIdx] || [];
+        let idxDocumento = headerRow.findIndex((c) => normalizeText(c).includes("documento"));
+        let idxQuantidade = headerRow.findIndex((c) => normalizeText(c).includes("quantidade"));
+        let idxValor = headerRow.findIndex((c, ci) => ci !== idxDocumento && normalizeText(c).includes("valor"));
+        if (idxDocumento < 0) idxDocumento = 1;
+        if (idxQuantidade < 0) idxQuantidade = 2;
+        if (idxValor < 0) idxValor = 3;
         for (let i = headerIdx + 1; i < rows.length; i++) {
           const r = rows[i];
-          if (!r || r[1] === null || r[1] === undefined || r[1] === "") continue;
+          if (!r || r[idxDocumento] === null || r[idxDocumento] === undefined || r[idxDocumento] === "") continue;
           items.push({
             dataCobranca: r[0],
-            nDocumento: String(r[1]).trim(),
-            quantidade: parseBR(r[2]),
-            valor: parseBR(r[3]),
+            nDocumento: String(r[idxDocumento]).trim(),
+            quantidade: parseBR(r[idxQuantidade]),
+            valor: parseBR(r[idxValor]),
           });
         }
+      } else {
+        abasSemDataCobranca.push(name);
       }
       detailSheets[codigo] = items;
     }
 
-    return { info, resumoRows, resumoTotals, detailSheets };
+    return { info, resumoRows, resumoTotals, impostoBlocos, detailSheets, abasSemCodigo, abasSemDataCobranca };
   }
 
   // `keyField` pode ser um nome só ou uma lista de candidatos (as bases
@@ -1261,26 +1400,57 @@ https://github.com/nodeca/pako/blob/main/LICENSE
   // entrada", ou seja, as duas usam o mesmo nome de coluna, não um por
   // direção). Usa localizarTabelaComColuna (procura em qualquer aba e nas
   // primeiras linhas de cada uma) em vez de travar na aba "Sheet"/linha 1.
+  // Nomes de coluna que trazem a chave de acesso da NF-e (44 dígitos) nas
+  // exportações do SAP — variam de exportação pra exportação, por isso é
+  // lista, igual ao Serial/Serial do Documento acima.
+  const CANDIDATOS_CHAVE_ACESSO = ["Chave acesso", "Chave de acesso", "Chave de Acesso", "Chave da Nfe", "Chave da NFe", "Chave NFe", "Chave"];
+
+  // Kate, 19/09/2026: "pode pesquisar as notas pela coluna da chave da
+  // danfe. É uma opção também" — em algumas faturas da Unilog (ex.: ES) o
+  // "Nº Documento" informado pode não bater com o Serial/Serial do
+  // Documento do SAP só pelo número curto. Por isso, além de indexar cada
+  // registro do SAP pelo Serial (como antes), indexamos o MESMO registro
+  // também pela chave de acesso da NF-e (só dígitos), quando essa coluna
+  // existir na base. No cruzamento, tentamos achar por Serial primeiro e,
+  // se não achar, tentamos de novo pela chave de acesso — assim funciona
+  // tanto quando a fatura usa o número curto quanto quando usa a chave
+  // completa, sem precisar adivinhar qual a Unilog vai mandar.
   async function loadSapIndex(files, keyField, warnings) {
     const candidatos = Array.isArray(keyField) ? keyField : [keyField, "Serial do Documento", "Serial"];
     const map = new Map();
+    const colunasDisponiveis = new Set();
     for (const f of files) {
       const wb = await readWorkbook(f);
       const achado = localizarTabelaComColuna(wb, candidatos);
-      if (!achado) { warnings.push(`Arquivo "${f.name}": não encontrei nenhuma das colunas ${candidatos.map((c) => `'${c}'`).join("/")} em nenhuma aba (procurei nas primeiras 15 linhas de cada uma). Abas do arquivo: ${wb.SheetNames.join(", ")}. Ignorado nesse cruzamento.`); continue; }
+      if (!achado) { warnings.push(`Arquivo "${f.name}": não encontrei nenhuma das colunas ${candidatos.map((c) => `'${c}'`).join("/")} em nenhuma aba (procurei nas primeiras 15 linhas de cada uma). Abas do arquivo: ${wb.SheetNames.join(", ")}.${avisoAbasComFalhaDeLeitura(wb)} Ignorado nesse cruzamento.`); continue; }
+      const idxChave = findColumnIdx(achado.idx, CANDIDATOS_CHAVE_ACESSO);
+      for (const k of Object.keys(achado.idx)) colunasDisponiveis.add(k);
       let carregados = 0;
+      let carregadosPorChave = 0;
       for (const row of achado.dataRows) {
         const raw = row[achado.colIdx];
-        if (raw === null || raw === undefined || raw === "") continue;
-        const serial = Math.trunc(Number(raw));
-        if (Number.isNaN(serial)) continue;
         const rec = {};
         for (const k of Object.keys(achado.idx)) rec[k] = row[achado.idx[k]];
-        map.set(String(serial), rec);
-        carregados++;
+        if (raw !== null && raw !== undefined && raw !== "") {
+          const serial = Math.trunc(Number(raw));
+          if (!Number.isNaN(serial)) { map.set(String(serial), rec); carregados++; }
+        }
+        if (idxChave !== undefined) {
+          const chaveDigits = String(row[idxChave] || "").replace(/\D/g, "");
+          if (chaveDigits.length >= 20) { map.set(chaveDigits, rec); carregadosPorChave++; }
+        }
       }
-      warnings.push(`Arquivo "${f.name}": ${carregados} registro(s) carregado(s) da aba "${achado.sheetName}" (cabeçalho encontrado na linha ${achado.headerRowIdx + 1} do arquivo). (Aviso informativo, não é um erro.)`);
+      warnings.push(`Arquivo "${f.name}": ${carregados} registro(s) carregado(s) da aba "${achado.sheetName}" (cabeçalho encontrado na linha ${achado.headerRowIdx + 1} do arquivo)${idxChave !== undefined ? `, também indexado(s) pela chave de acesso da NF-e (${carregadosPorChave} com chave válida)` : ""}. (Aviso informativo, não é um erro.)`);
     }
+    // Guardado no próprio Map (metadado, não afeta o uso normal como índice)
+    // pra quem for cruzar poder distinguir "documento não achado" de
+    // "documento achado, mas essa exportação não trouxe a coluna de
+    // status" — Kate, 19/09/2026: uma base de entrada do ES "limpa" (menos
+    // colunas, pra caber no navegador) removeu sem querer a coluna
+    // "Descrição situação" junto com as fiscais que não eram necessárias, e
+    // isso fazia toda nota achada cair como "STATUS_DIVERGENTE" (parecendo
+    // problema real) quando na verdade é só a base não trazer aquele campo.
+    map.__colunasDisponiveis = colunasDisponiveis;
     return map;
   }
 
@@ -1409,22 +1579,55 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     "ano", "ate", "the", "of", "sendo", "seu", "sua",
   ]);
 
+  // Grafias equivalentes que aparecem ora na fatura, ora na tabela de
+  // tarifas, mas que o normalizeText (só acento/caixa) não unifica sozinho —
+  // Kate, 19/09/2026: a fatura da Unilog RJ cobra "QUANTIDADE DE PALLET
+  // RECEBIDO" (inglês "pallet", com 2 L) enquanto a tabela de tarifas fala
+  // em "posição palete"/"por palete" (grafia em português, 1 L). Sem
+  // normalizar isso pra uma palavra só, o casamento por palavra-chave
+  // perdia esse ponto em comum e a linha caía como "NAO_MAPEADO" mesmo
+  // sendo claramente o mesmo serviço.
+  const KEYWORD_SYNONYMS = {
+    pallet: "palete", pallets: "palete", paletes: "palete",
+    // Kate, 19/09/2026: fatura SP tinha "[7] H.E - SÁBADO DE 06:00 ÀS
+    // 22:00" (44,6424, valor batendo exato) marcado como NÃO MAPEADO contra
+    // a tabela oficial "Serviço em hora extra, realizado aos SÁBADOS das
+    // 06h às 22h..." — a fatura fala no singular (o dia), a tabela no
+    // plural (os sábados que a regra vale). Mesmo padrão provável para
+    // domingo/feriado nas outras linhas de Hora Extra dessa mesma seção.
+    sabados: "sabado", domingos: "domingo", feriados: "feriado",
+  };
+
+  // Kate, 19/09/2026: mesmo caso de "H.E - SÁBADO" acima — a fatura escreve
+  // o horário como "06:00"/"22:00" (com ":00") e a tabela oficial como
+  // "06h"/"22h" (com "h" grudado no número), então "06" e "06h" nunca
+  // batiam como a mesma palavra-chave mesmo sendo o mesmo horário. Unifica
+  // os dois formatos pro mesmo token ANTES de separar em palavras.
+  function normalizeHorarios(s) {
+    return String(s || "")
+      .replace(/(\d{1,2})h\b/gi, "$1")
+      .replace(/(\d{1,2}):00\b/g, "$1");
+  }
+
   function keywordSet(s) {
     return new Set(
-      normalizeText(s)
+      normalizeText(normalizeHorarios(s))
         .split(/[^a-z0-9]+/)
         .filter((w) => w.length >= 2 && !STOPWORDS.has(w))
+        .map((w) => KEYWORD_SYNONYMS[w] || w)
     );
   }
 
   // Best-effort unit hint (pallet / unidade / volume) so we never match, say,
   // a "por volume" service line to a tarifa entry priced "por unidade" just
   // because the surrounding words overlap — the units aren't interchangeable.
+  // Cobre as duas grafias de palete/pallet pelo mesmo motivo do
+  // KEYWORD_SYNONYMS acima.
   function extractUnitHint(s) {
     const n = normalizeText(s);
     if (/\bvol(ume)?\b/.test(n) || /\bcaixa\b/.test(n)) return "volume";
     if (/\bunidade(s)?\b/.test(n) || /\bun\b/.test(n) || /\bpec[ae]s?\b/.test(n)) return "unidade";
-    if (/\bpallet(s)?\b/.test(n)) return "pallet";
+    if (/\bpallet(s)?\b/.test(n) || /\bpalete(s)?\b/.test(n)) return "pallet";
     return null;
   }
 
@@ -1449,21 +1652,60 @@ https://github.com/nodeca/pako/blob/main/LICENSE
   // NFs expedidas naquele mês. Não é um valor fixo por item como as demais
   // tarifas, por isso tem sua própria função de faixa (mesmo padrão do
   // Frete Peso da FSL: acha a faixa [de, até] que contém a quantidade
-  // faturada naquele mês).
+  // faturada naquele mês). Na fatura real da Unilog RJ esse serviço vem
+  // como "[5] OPERAÇÃO B2C - POR DOCUMENTO" (Kate, 19/09/2026), não com as
+  // palavras "nota fiscal"/"expedida" do texto oficial da tabela — por isso
+  // o segundo padrão (b2c + documento) cobre essa redação também.
   function ehServicoPorNotaFiscalExpedida(codigo) {
     const n = normalizeText(codigo);
-    return n.includes("nota fiscal") && (n.includes("expedid") || n.includes("escala") || n.includes("regressiv"));
+    const porNotaFiscalExpedida = n.includes("nota fiscal") && (n.includes("expedid") || n.includes("escala") || n.includes("regressiv"));
+    const b2cPorDocumento = n.includes("b2c") && n.includes("documento");
+    return porNotaFiscalExpedida || b2cPorDocumento;
   }
   function encontrarFaixaRegressivaUnilog(qtde, tiers) {
     if (!Array.isArray(tiers) || !tiers.length || qtde === null || qtde === undefined) return null;
     return tiers.find((t) => qtde >= t.de && qtde <= t.ate) || null;
   }
 
+  // Kate, 19/09/2026: "o custo do B2C por documento é considerado
+  // calculando o total dos pedidos dos 03 CDs" — a Unilog fatura cada CD
+  // (BTC/SP/ES/RJ...) separadamente, mas a FAIXA da tabela regressiva por
+  // Nota Fiscal (item B2C) depende do volume somado dos 3 CDs no mês, não
+  // só do volume desta fatura. Como o validador só processa uma fatura por
+  // vez, esse total precisa ser informado manualmente aqui a cada rodada —
+  // é o único parâmetro editável do módulo Unilog.
+  const UNILOG_PARAMS_DEFAULT = {
+    storageKey: "unilog_params_v1",
+    label: "Parâmetros Unilog — confira/atualize antes de cada validação",
+    groups: [
+      {
+        title: "Tabela regressiva por Nota Fiscal expedida/mês (B2C)",
+        fields: [
+          { key: "qtdeTotalNF3CDs", label: "Total de NF expedidas nos 3 CDs no mês (B2C)", default: 0, source: "Kate, 19/09/2026 — some o volume de NF expedidas do mês nos 3 CDs (BTC/SP/ES/RJ, conforme aplicável) para achar a faixa certa da tabela regressiva. A comparação do valor cobrado continua sendo feita só com os dados desta fatura." },
+        ],
+      },
+      {
+        // A fatura da Unilog não identifica a unidade por sigla (o campo
+        // "Estabelecimento" traz só um código interno + razão social, ex.:
+        // "[5] UNILOG EXPRESS LOGISTICA S/A"), então não dá pra deduzir
+        // sozinho se é SP ou ES/RJ/BTC — por isso o campo é digitável, pra
+        // Kate escolher a alíquota certa antes de rodar cada fatura, em vez
+        // do sistema arriscar adivinhar errado.
+        title: "Impostos sobre os serviços (ISS + PIS/COFINS)",
+        fields: [
+          { key: "issAplicavelPct", label: "ISS aplicável nesta fatura (%) — SP: 2 | ES, RJ e BTC: 5", default: 5, source: "Kate, 19/09/2026 — \"SP: ISS 2%... ES, RJ e BTC: ISS 5%\". Ajuste conforme a unidade desta fatura antes de rodar (a fatura não informa a sigla da unidade, só um código interno)." },
+          { key: "pisCofinsPct", label: "PIS/COFINS aplicável (%) — todas as unidades", default: 9.25, source: "Kate, 19/09/2026 — 9,25% em todas as unidades (SP, ES, RJ, BTC)." },
+        ],
+      },
+    ],
+  };
+
   const UNILOG = {
     id: "unilog",
     label: "Unilog",
     description:
       "Lê o relatório de faturamento Unilog (Resumo de Serviços + detalhamento por serviço) de qualquer depositante/unidade (BTC, SP, ES, RJ...), cruza recebimento e operação B2B (unidade/volume) contra as bases SAP de entrada e saída, e — se a planilha de tarifas for enviada — compara o valor unitário cobrado com a 'Tarifa que UNILOG aplicou'.",
+    params: UNILOG_PARAMS_DEFAULT,
     inputs: [
       {
         key: "fatura",
@@ -1487,7 +1729,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
         accept: ".xls,.xlsx",
         multiple: true,
         required: false,
-        desc: "Exportação SAP de notas de saída (coluna 'Serial do Documento'). Usada para cruzar Operação B2B (unidade/volume).",
+        desc: "Exportação SAP de notas de saída (coluna 'Serial do Documento'). Usada para cruzar Operação B2B e Operação B2C (o B2C costuma ser o maior volume — dezenas de milhares de documentos por fatura).",
       },
       {
         key: "tarifa",
@@ -1501,8 +1743,16 @@ https://github.com/nodeca/pako/blob/main/LICENSE
 
     async validate(files) {
       const warnings = [];
-      const { info, resumoRows, resumoTotals, detailSheets } = await parseUnilogFatura(files.fatura[0]);
+      const params = currentParams();
+      const { info, resumoRows, resumoTotals, impostoBlocos, detailSheets, abasSemCodigo, abasSemDataCobranca } = await parseUnilogFatura(files.fatura[0]);
       if (!resumoRows.length) throw new Error("Não foi possível localizar a aba 'Resumo de Serviços' ou seus dados na fatura.");
+
+      if (abasSemCodigo && abasSemCodigo.length) {
+        warnings.push(`${abasSemCodigo.length} aba(s) da fatura não reconhecida(s) como detalhamento de serviço (não encontrei a linha "Código:" na coluna A): ${abasSemCodigo.join(", ")}. Se alguma dessas for a aba de Recebimento/B2B, o cruzamento com o SAP não vai incluir esse serviço — confira se a aba não foi renomeada/editada antes do envio.`);
+      }
+      if (abasSemDataCobranca && abasSemDataCobranca.length) {
+        warnings.push(`${abasSemDataCobranca.length} aba(s) de detalhamento com "Código:" reconhecido, mas sem a linha "Data Cobrança" (cabeçalho da tabela de itens): ${abasSemDataCobranca.join(", ")}. Essa(s) aba(s) ficou(aram) sem nenhum item carregado, então não entram no cruzamento com o SAP.`);
+      }
 
       const entradaIndex = files.entrada && files.entrada.length ? await loadSapIndex(files.entrada, "Serial", warnings) : new Map();
       const saidaIndex = files.saida && files.saida.length ? await loadSapIndex(files.saida, "Serial do Documento", warnings) : new Map();
@@ -1510,18 +1760,42 @@ https://github.com/nodeca/pako/blob/main/LICENSE
 
       // ---- Crosswalk entrada/saída ----
       const crosswalkRows = [];
+      const codigosSemRegra = [];
+      const colunaStatusFaltandoAvisada = new Set(); // evita repetir o mesmo aviso por tipo
       for (const [codigo, items] of Object.entries(detailSheets)) {
         const rule = CROSSWALK_RULES.find((r) => r.test(codigo));
-        if (!rule) continue;
+        if (!rule) { codigosSemRegra.push(codigo); continue; }
         const idxMap_ = rule.type === "entrada" ? entradaIndex : saidaIndex;
         if (idxMap_.size === 0) continue; // base não enviada, pula
+        // A base pode ter sido enviada sem a coluna de status (ex.: Kate,
+        // 19/09/2026 — uma base de entrada do ES "enxuta" veio sem a
+        // "Descrição situação" pra caber no navegador). Sem essa coluna,
+        // TODA nota encontrada cairia como "STATUS_DIVERGENTE", parecendo
+        // problema real quando é só limitação da base enviada — por isso
+        // tratamos como um status neutro específico em vez de divergência.
+        const temColunaStatus = idxMap_.__colunasDisponiveis && idxMap_.__colunasDisponiveis.has(rule.statusField);
+        if (!temColunaStatus && !colunaStatusFaltandoAvisada.has(rule.type)) {
+          colunaStatusFaltandoAvisada.add(rule.type);
+          warnings.push(`Base SAP de ${rule.type} enviada, mas sem a coluna "${rule.statusField}" — as notas encontradas nessa base aparecem como "documento encontrado, status não conferido" em vez de OK/divergente, porque não dá pra confirmar a situação do documento sem essa coluna. Se quiser essa confirmação também, inclua "${rule.statusField}" na exportação.`);
+        }
         for (const item of items) {
           const nParsed = parseInt(item.nDocumento, 10);
           const key = Number.isNaN(nParsed) ? item.nDocumento : String(nParsed);
-          const rec = idxMap_.get(key);
+          // Tenta pelo Serial (número curto) primeiro; se não achar, tenta de
+          // novo pela chave de acesso da NF-e (44 dígitos) — a Unilog pode
+          // mandar qualquer um dos dois em "Nº Documento" dependendo da
+          // unidade, e o índice guarda o mesmo registro sob as duas chaves
+          // (ver loadSapIndex).
+          let rec = idxMap_.get(key);
+          if (!rec) {
+            const chaveDigits = String(item.nDocumento).replace(/\D/g, "");
+            if (chaveDigits.length >= 20) rec = idxMap_.get(chaveDigits);
+          }
           let status, statusValor = null;
           if (!rec) {
             status = "NAO_ENCONTRADA";
+          } else if (!temColunaStatus) {
+            status = "ENCONTRADA_SEM_STATUS";
           } else {
             statusValor = rec[rule.statusField];
             status = rule.okValues.includes(statusValor) ? "OK" : "STATUS_DIVERGENTE";
@@ -1538,6 +1812,14 @@ https://github.com/nodeca/pako/blob/main/LICENSE
           });
         }
       }
+      // Diagnóstico: se veio base SAP (entrada e/ou saída) mas alguma aba de
+      // detalhamento não bateu com nenhuma regra de RECEBIMENTO/OPERAÇÃO B2B
+      // (CROSSWALK_RULES), ela fica de fora do cruzamento silenciosamente —
+      // lista aqui os códigos ignorados pra facilitar diagnosticar um caso
+      // como o de recebimento não comparado (Kate, 19/09/2026).
+      if (codigosSemRegra.length && ((files.entrada && files.entrada.length) || (files.saida && files.saida.length))) {
+        warnings.push(`${codigosSemRegra.length} aba(s) de detalhamento com serviço não coberto pelas regras de cruzamento (Recebimento/Descarga de entrada, Operação B2B ou Operação B2C de saída) — não entram no cruzamento com o SAP mesmo com a base enviada: ${codigosSemRegra.map((c) => `"${c}"`).join("; ")}. Se um desses for recebimento/B2B/B2C com nome diferente do esperado, avise para eu ajustar a regra de reconhecimento.`);
+      }
 
       // ---- Cost check ----
       const resumoOut = resumoRows.map((svc) => {
@@ -1546,15 +1828,29 @@ https://github.com/nodeca/pako/blob/main/LICENSE
         // planilha de tarifas é o Informativo de Reajuste oficial da Unilog
         // — ver parseUnilogReajusteOficial/loadTarifaTable): o preço por NF
         // depende do volume faturado no mês, não é um valor fixo, então tem
-        // prioridade sobre o casamento genérico por palavra-chave.
-        const faixaRegressiva = tarifaTable.regressiva && tarifaTable.regressiva.length && ehServicoPorNotaFiscalExpedida(svc.codigo)
-          ? encontrarFaixaRegressivaUnilog(svc.qtde, tarifaTable.regressiva)
-          : null;
-        if (faixaRegressiva) {
-          tarifaEsperada = faixaRegressiva.valor;
-          matchedDesc = `Tabela regressiva por Nota Fiscal expedida/mês — faixa ${faixaRegressiva.de}–${faixaRegressiva.ate === Infinity ? "acima" : faixaRegressiva.ate} NF (tarifa ${fmtNumber(faixaRegressiva.valor)}/NF pelo volume de ${svc.qtde ?? "?"} NF cobradas nesta fatura)`;
-          desvioPct = tarifaEsperada > 0 ? (svc.valorUnitario - tarifaEsperada) / tarifaEsperada : 0;
-          status = Math.abs(desvioPct) > TOLERANCIA_PADRAO ? "DIVERGENTE" : "CORRETO";
+        // prioridade sobre o casamento genérico por palavra-chave. Kate,
+        // 19/09/2026: "o custo do B2C por documento é considerado
+        // calculando o total dos pedidos dos 03 CDs" — a faixa usa o total
+        // combinado dos 3 CDs (informado em Parâmetros), NÃO a quantidade
+        // desta fatura sozinha (svc.qtde é só deste CD/depositante).
+        const ehItemRegressiva = tarifaTable.regressiva && tarifaTable.regressiva.length && ehServicoPorNotaFiscalExpedida(svc.codigo);
+        if (ehItemRegressiva) {
+          const qtdeTotal3CDs = params.qtdeTotalNF3CDs;
+          if (!qtdeTotal3CDs) {
+            status = "REVISAO_MANUAL";
+            matchedDesc = `Tabela regressiva por Nota Fiscal expedida/mês — a faixa depende do volume TOTAL de NF dos 3 CDs, não só desta fatura. Informe o total em Parâmetros ("Total de NF expedidas nos 3 CDs no mês") para validar esta linha.`;
+          } else {
+            const faixaRegressiva = encontrarFaixaRegressivaUnilog(qtdeTotal3CDs, tarifaTable.regressiva);
+            if (!faixaRegressiva) {
+              status = "REVISAO_MANUAL";
+              matchedDesc = `Tabela regressiva por Nota Fiscal expedida/mês — o total informado (${qtdeTotal3CDs} NF) não caiu em nenhuma faixa da tabela carregada.`;
+            } else {
+              tarifaEsperada = faixaRegressiva.valor;
+              matchedDesc = `Tabela regressiva por Nota Fiscal expedida/mês — faixa ${faixaRegressiva.de}–${faixaRegressiva.ate === Infinity ? "acima" : faixaRegressiva.ate} NF (tarifa ${fmtNumber(faixaRegressiva.valor)}/NF pelo volume TOTAL informado dos 3 CDs: ${qtdeTotal3CDs} NF)`;
+              desvioPct = tarifaEsperada > 0 ? (svc.valorUnitario - tarifaEsperada) / tarifaEsperada : 0;
+              status = Math.abs(desvioPct) > TOLERANCIA_PADRAO ? "DIVERGENTE" : "CORRETO";
+            }
+          }
         } else if (!tarifaTable.length) {
           status = "SEM_PLANILHA_TARIFA";
         } else {
@@ -1592,7 +1888,19 @@ https://github.com/nodeca/pako/blob/main/LICENSE
         const rows = crosswalkRows.filter((r) => r.Tipo === type);
         if (!rows.length) continue;
         const ok = rows.filter((r) => r.Status === "OK").length;
-        cwByType[type] = { total: rows.length, ok, naoEncontrada: rows.filter((r) => r.Status === "NAO_ENCONTRADA").length, divergente: rows.filter((r) => r.Status === "STATUS_DIVERGENTE").length };
+        const semStatus = rows.filter((r) => r.Status === "ENCONTRADA_SEM_STATUS").length;
+        // "Encontradas" (pro KPI) conta OK + ENCONTRADA_SEM_STATUS — o
+        // documento existe na base enviada nos dois casos; a diferença é só
+        // se dava pra confirmar a situação dele ou não (ver nota em
+        // loadSapIndex/validate sobre coluna de status ausente).
+        cwByType[type] = {
+          total: rows.length,
+          ok,
+          semStatus,
+          encontrada: ok + semStatus,
+          naoEncontrada: rows.filter((r) => r.Status === "NAO_ENCONTRADA").length,
+          divergente: rows.filter((r) => r.Status === "STATUS_DIVERGENTE").length,
+        };
       }
       const cCusto = countBy(resumoOut, "StatusCusto");
 
@@ -1600,11 +1908,33 @@ https://github.com/nodeca/pako/blob/main/LICENSE
         { label: "Período da fatura", value: `${info.dataInicial || "?"} – ${info.dataFinal || "?"}`, tone: "neutral", desc: "Período de referência informado na própria fatura da Unilog." },
         { label: "Serviços na fatura", value: resumoRows.length, tone: "neutral", desc: "Quantidade de linhas de serviço (armazenagem, movimentação, etc.) no Resumo de Serviços da fatura." },
       ];
-      if (cwByType["Entrada"]) {
-        kpis.push({ label: "Entrada — encontradas", value: `${cwByType["Entrada"].ok}/${cwByType["Entrada"].total}`, tone: cwByType["Entrada"].ok === cwByType["Entrada"].total ? "good" : "warning", desc: "Notas de entrada cobradas pela Unilog que foram localizadas na base de entrada do SAP enviada." });
+      // Sempre mostra um KPI de Entrada/Saída, mesmo quando não há nada pra
+      // cruzar — Kate, 19/09/2026: depois de um ajuste o KPI de cruzamento
+      // simplesmente sumiu da tela sem explicação ("agora vc retirou a
+      // validação das notas"), e ela não tinha como saber se foi por não ter
+      // enviado a base, por nenhuma aba da fatura ter batido com a regra de
+      // Recebimento/B2B, ou por um bug de verdade. Antes, o KPI só aparecia
+      // quando havia pelo menos 1 linha de cruzamento (crosswalkRows.length
+      // > 0 para aquele tipo) — se desse zero linhas por qualquer motivo, o
+      // indicador inteiro desaparecia silenciosamente. Agora ele sempre
+      // aparece com um motivo explícito.
+      const entradaEnviada = !!(files.entrada && files.entrada.length);
+      const saidaEnviada = !!(files.saida && files.saida.length);
+      if (!entradaEnviada) {
+        kpis.push({ label: "Entrada — encontradas", value: "base não enviada", tone: "neutral", desc: "Base SAP de entrada não enviada nesta validação — o cruzamento das notas de recebimento com o SAP não foi feito (isso não afeta a checagem de custo/tarifa)." });
+      } else if (cwByType["Entrada"]) {
+        const d = cwByType["Entrada"];
+        kpis.push({ label: "Entrada — encontradas", value: `${d.encontrada}/${d.total}`, tone: d.divergente > 0 ? "critical" : d.encontrada === d.total ? "good" : "warning", desc: `Notas de entrada cobradas pela Unilog que foram localizadas na base de entrada do SAP enviada.${d.semStatus ? ` ${d.semStatus} delas foram encontradas mas sem confirmar a situação do documento, porque a base enviada não trouxe a coluna de status.` : ""}` });
+      } else {
+        kpis.push({ label: "Entrada — encontradas", value: "0 itens de recebimento na fatura", tone: "warning", desc: "A base de entrada foi enviada, mas nenhuma aba de detalhamento da fatura foi reconhecida como Recebimento (regra RECEB.../exclui reversa/devolução) para cruzar com ela. Confira os avisos desta validação — pode ser um nome de aba/serviço de recebimento fora do padrão esperado." });
       }
-      if (cwByType["Saída"]) {
-        kpis.push({ label: "Saída — encontradas", value: `${cwByType["Saída"].ok}/${cwByType["Saída"].total}`, tone: cwByType["Saída"].ok === cwByType["Saída"].total ? "good" : "warning", desc: "Notas de saída cobradas pela Unilog que foram localizadas na base de saída do SAP enviada." });
+      if (!saidaEnviada) {
+        kpis.push({ label: "Saída — encontradas", value: "base não enviada", tone: "neutral", desc: "Base SAP de saída não enviada nesta validação — o cruzamento das notas de saída (Operação B2B e B2C) com o SAP não foi feito (isso não afeta a checagem de custo/tarifa)." });
+      } else if (cwByType["Saída"]) {
+        const d = cwByType["Saída"];
+        kpis.push({ label: "Saída — encontradas", value: `${d.encontrada}/${d.total}`, tone: d.divergente > 0 ? "critical" : d.encontrada === d.total ? "good" : "warning", desc: `Notas de saída cobradas pela Unilog que foram localizadas na base de saída do SAP enviada.${d.semStatus ? ` ${d.semStatus} delas foram encontradas mas sem confirmar a situação do documento, porque a base enviada não trouxe a coluna de status.` : ""}` });
+      } else {
+        kpis.push({ label: "Saída — encontradas", value: "0 itens de saída na fatura", tone: "warning", desc: "A base de saída foi enviada, mas nenhuma aba de detalhamento da fatura foi reconhecida como Operação B2B ou B2C para cruzar com ela. Confira os avisos desta validação — pode ser um nome de aba/serviço de saída fora do padrão esperado." });
       }
       if (tarifaTable.length) {
         kpis.push({ label: "Custo correto", value: cCusto.CORRETO || 0, tone: "good", desc: "Linhas do Resumo de Serviços cujo valor cobrado bate com a 'Tarifa que UNILOG aplicou' na planilha de tarifa enviada." });
@@ -1614,10 +1944,81 @@ https://github.com/nodeca/pako/blob/main/LICENSE
         kpis.push({ label: "Planilha de tarifa", value: "não enviada", tone: "neutral", desc: "Sem a planilha de tarifa contratada não é possível verificar se os valores cobrados por serviço estão corretos." });
       }
       if (resumoTotals.totalFaturar !== undefined && resumoTotals.totalFaturar !== null) {
-        kpis.push({ label: "Total a faturar (fatura)", value: "R$ " + fmtMoney(resumoTotals.totalFaturar), tone: "neutral", desc: "Valor total a faturar informado no rodapé da própria fatura da Unilog." });
+        kpis.push({ label: "Total a faturar (fatura)", value: "R$ " + fmtMoney(resumoTotals.totalFaturar), tone: "neutral", desc: "Valor total a faturar informado no rodapé da própria fatura da Unilog. Se a fatura tiver mais de um bloco de serviços (ex.: um bloco geral e outro só de Operação B2B/B2C), este total já é a SOMA de todos os blocos." });
+      }
+
+      // ---- Impostos (ISS + PIS/COFINS) ----
+      // Kate, 19/09/2026: "vc valida também os custos dos impostos sobre os
+      // valores cobrados?" / "SP: ISS 2%, PIS/COFINS 9.25% | ES, RJ e BTC:
+      // ISS 5%, PIS/COFINS 9.25%". A própria Unilog já escreve a alíquota
+      // que aplicou no rótulo de cada bloco (ex.: "IMPOSTOS = 5% (ISS) +
+      // 9,25% (PIS/ COFINS)") — comparamos essa alíquota IMPRESSA NA FATURA
+      // com a que a Kate espera (Parâmetros) e, junto, recalculamos o valor
+      // de Impostos/Total a Faturar esperado (Apuração × alíquota) pra
+      // conferir a conta em cima disso. A fatura não diz a sigla da
+      // unidade (só um código interno da Unilog), por isso o campo de ISS
+      // esperado é digitável em Parâmetros — sem isso não dá pra saber se
+      // 5% é o certo ou se deveria ser 2% (SP).
+      const impostoRows = (impostoBlocos || [])
+        // Só entra na conferência quem tem os 3 números (Apuração, Impostos
+        // e Total a Faturar) — uma fatura sem esse rodapé completo (ex.:
+        // fixture de teste sem os valores reais) não deve aparecer como
+        // "CORRETO" por padrão só porque não achou nada pra contestar.
+        .filter((b) => b.apuracao !== null && b.impostos !== null && b.totalFaturar !== null)
+        .map((b, i) => {
+          const issFatura = b.issPctFatura;
+          const pisCofinsFatura = b.pisCofinsPctFatura;
+          const aliqEsperadaTotal = (params.issAplicavelPct || 0) + (params.pisCofinsPct || 0);
+          // Conferido contra a conta real da fatura: o imposto é calculado
+          // "por dentro" (gross-up), não simplesmente Apuração × alíquota.
+          // Ex. ES: Apuração 221.207,21 com 14,25% (5% ISS + 9,25%
+          // PIS/COFINS) dá Total a Faturar = Apuração / (1 − 0,1425) =
+          // 257.967,59 — bate exatamente com o total da fatura real; a
+          // conta "por fora" (Apuração × 14,25%) dava um valor de imposto
+          // bem menor e não fechava.
+          const totalFaturarEsperado = b.apuracao !== null ? round2(b.apuracao / (1 - aliqEsperadaTotal / 100)) : null;
+          const impostosEsperado = totalFaturarEsperado !== null ? round2(totalFaturarEsperado - b.apuracao) : null;
+          const aliqDivergente =
+            (issFatura !== null && Math.abs(issFatura - params.issAplicavelPct) > 0.01) ||
+            (pisCofinsFatura !== null && Math.abs(pisCofinsFatura - params.pisCofinsPct) > 0.01);
+          const impostosCobrado = b.impostos !== null ? round2(b.impostos) : null;
+          const valorDivergente = impostosEsperado !== null && impostosCobrado !== null && Math.abs(impostosCobrado - impostosEsperado) > 0.5;
+          let status;
+          if (aliqDivergente) status = "ALIQUOTA_DIVERGENTE";
+          else if (valorDivergente) status = "VALOR_DIVERGENTE";
+          else status = "CORRETO";
+          return {
+            Bloco: i + 1,
+            Apuracao: b.apuracao !== null ? round2(b.apuracao) : null,
+            "ISS na fatura (%)": issFatura,
+            "PIS/COFINS na fatura (%)": pisCofinsFatura,
+            ImpostosCobrado: impostosCobrado,
+            ImpostosEsperado: impostosEsperado,
+            TotalFaturarCobrado: b.totalFaturar !== null ? round2(b.totalFaturar) : null,
+            TotalFaturarEsperado: totalFaturarEsperado,
+            Status: status,
+          };
+        });
+      if (impostoRows.length) {
+        const cImp = countBy(impostoRows, "Status");
+        kpis.push({
+          label: "Impostos — alíquota aplicada",
+          value: cImp.ALIQUOTA_DIVERGENTE ? `${cImp.ALIQUOTA_DIVERGENTE}/${impostoRows.length} bloco(s) diferente do esperado` : "confere com o esperado",
+          tone: cImp.ALIQUOTA_DIVERGENTE ? "critical" : "good",
+          desc: `Compara o ISS/PIS-COFINS que a própria Unilog escreveu no rodapé da fatura (ex.: "IMPOSTOS = 5% (ISS) + 9,25% (PIS/COFINS)") com o esperado em Parâmetros (${params.issAplicavelPct}% ISS + ${params.pisCofinsPct}% PIS/COFINS). Se divergir, confira se a unidade selecionada em Parâmetros (SP vs. ES/RJ/BTC) é a certa para esta fatura, ou se a Unilog aplicou a alíquota errada.`,
+        });
+        kpis.push({
+          label: "Impostos — valor cobrado",
+          value: `${cImp.CORRETO || 0}/${impostoRows.length} bloco(s) corretos`,
+          tone: cImp.VALOR_DIVERGENTE || cImp.ALIQUOTA_DIVERGENTE ? "critical" : "good",
+          desc: "Confere se o valor de Impostos e o Total a Faturar de cada bloco batem com o cálculo 'por dentro' (Total = Apuração ÷ (1 − alíquota), Impostos = Total − Apuração) na alíquota esperada (tolerância de R$ 0,50 por arredondamento).",
+        });
       }
 
       const notes = [];
+      if (impostoRows.some((r) => r.Status === "ALIQUOTA_DIVERGENTE")) {
+        notes.push(`A alíquota de imposto impressa na fatura não bate com o esperado em Parâmetros — confira se selecionou a unidade certa (SP: ISS 2% | ES/RJ/BTC: ISS 5%) antes de contestar qualquer valor de imposto.`);
+      }
       if (cCusto.DIVERGENTE) {
         notes.push(`Há ${cCusto.DIVERGENTE} linha(s) com custo divergente da tarifa contratada — confira a coluna 'StatusCusto' na aba Resumo de Serviços e, se confirmado, use esses valores como base para contestar com a Unilog.`);
       }
@@ -1628,6 +2029,12 @@ https://github.com/nodeca/pako/blob/main/LICENSE
           statusCols: { StatusCusto: mapCustoBadge },
         },
       };
+      if (impostoRows.length) {
+        tables["Impostos (ISS + PIS/COFINS)"] = {
+          rows: impostoRows,
+          statusCols: { Status: mapImpostoBadge },
+        };
+      }
       if (crosswalkRows.length) {
         tables["Cruzamento Entrada/Saída"] = {
           rows: crosswalkRows,
@@ -1653,6 +2060,13 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     if (v === "OK") return "ok";
     if (v === "NAO_ENCONTRADA") return "bad";
     if (v === "STATUS_DIVERGENTE") return "warn";
+    if (v === "ENCONTRADA_SEM_STATUS") return "neutral";
+    return "neutral";
+  }
+  function mapImpostoBadge(v) {
+    if (v === "CORRETO") return "ok";
+    if (v === "ALIQUOTA_DIVERGENTE") return "bad";
+    if (v === "VALOR_DIVERGENTE") return "warn";
     return "neutral";
   }
 
@@ -3403,7 +3817,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
           // Procura em TODAS as abas e nas primeiras linhas de cada uma
           // (não só a aba "Sheet" / linha 1) — exportações reais variam.
           const achado = localizarTabelaComColuna(wb, ["Serial do Documento", "Serial"]);
-          if (!achado) { warnings.push(`Base SAP saída "${f.name}": não encontrei a coluna 'Serial do Documento' (nem 'Serial') em nenhuma aba (procurei nas primeiras 15 linhas de cada uma). Abas do arquivo: ${wb.SheetNames.join(", ")}. Arquivo ignorado — confirme se é a exportação certa.`); continue; }
+          if (!achado) { warnings.push(`Base SAP saída "${f.name}": não encontrei a coluna 'Serial do Documento' (nem 'Serial') em nenhuma aba (procurei nas primeiras 15 linhas de cada uma). Abas do arquivo: ${wb.SheetNames.join(", ")}.${avisoAbasComFalhaDeLeitura(wb)} Arquivo ignorado — confirme se é a exportação certa.`); continue; }
           let carregados = 0;
           for (const r of achado.dataRows) {
             const n = normalizeNFKey(r[achado.colIdx]);
@@ -3418,7 +3832,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
         for (const f of files.sapEntrada) {
           const wb = await readWorkbook(f);
           const achado = localizarTabelaComColuna(wb, ["Serial", "Serial do Documento"]);
-          if (!achado) { warnings.push(`Base SAP entrada "${f.name}": não encontrei a coluna 'Serial' (nem 'Serial do Documento') em nenhuma aba (procurei nas primeiras 15 linhas de cada uma). Abas do arquivo: ${wb.SheetNames.join(", ")}. Arquivo ignorado.`); continue; }
+          if (!achado) { warnings.push(`Base SAP entrada "${f.name}": não encontrei a coluna 'Serial' (nem 'Serial do Documento') em nenhuma aba (procurei nas primeiras 15 linhas de cada uma). Abas do arquivo: ${wb.SheetNames.join(", ")}.${avisoAbasComFalhaDeLeitura(wb)} Arquivo ignorado.`); continue; }
           const modeloIdx = findColumnIdx(achado.idx, ["Modelo", "Modelo Fiscal"]);
           let modelo55Count = 0, total = 0;
           for (const r of achado.dataRows) {
