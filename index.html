@@ -1,4 +1,4 @@
-a<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
 <meta charset="UTF-8">
@@ -1284,6 +1284,69 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     return map;
   }
 
+  // Formato OFICIAL da Unilog ("Informativo de Reajuste Anual de Contrato
+  // Unilog Express Logística S/A", ex.: aba "Reajuste 2026") — Kate,
+  // 19/09/2026: "favor, considerar esse modelo de tabela de custos da
+  // Unilog no validador ou esse na versão pdf (considere o valor ajustado
+  // ou atual)". Conferido cruzando a planilha com o PDF do mesmo
+  // informativo: a coluna "Valor atual" da PLANILHA já corresponde ao
+  // "Valor reajustado" do PDF (ou seja, a planilha entrega só o valor
+  // final já vigente, com o reajuste aplicado) — por isso usamos essa
+  // coluna direto, sem recalcular reajuste algum aqui.
+  //
+  // O documento tem várias tabelinhas empilhadas na mesma aba, cada uma
+  // com seu próprio cabeçalho de colunas:
+  //   - "Item" / "Descrição" / "Valor atual" — usada em várias seções
+  //     (Tarifário da Operação, Mão de Obra Dedicada/Hora Extra,
+  //     Condições Gerais, Sublocações).
+  //   - "Escala" / "De" / "Até" / "Valor atual" — a tabela regressiva por
+  //     Nota Fiscal expedida/mês (preço por faixa de volume).
+  // Não dependemos do texto do título de cada seção (varia/repete "9)" em
+  // mais de uma tabela no PDF) — só do FORMATO da linha de cabeçalho, que
+  // é sempre um desses dois.
+  const UNILOG_REAJUSTE_HEADER_ITEM = ["item", "descricao", "valor atual"];
+  const UNILOG_REAJUSTE_HEADER_ESCALA = ["escala", "de", "ate", "valor atual"];
+
+  function linhaBateHeader(row, esperado) {
+    if (!row) return false;
+    for (let i = 0; i < esperado.length; i++) {
+      if (normalizeText(row[i]).trim() !== esperado[i]) return false;
+    }
+    return true;
+  }
+
+  function parseUnilogReajusteOficial(wb) {
+    const items = [];
+    const regressiva = [];
+    for (const sheetName of wb.SheetNames) {
+      const rows = sheetToRows(wb.Sheets[sheetName]);
+      let modo = null; // "item" | "escala" | null — reseta a cada linha em branco
+      for (const row of rows) {
+        const linhaVazia = !row || row.every((v) => v === null || v === undefined || v === "");
+        if (linhaVazia) { modo = null; continue; }
+        if (linhaBateHeader(row, UNILOG_REAJUSTE_HEADER_ITEM)) { modo = "item"; continue; }
+        if (linhaBateHeader(row, UNILOG_REAJUSTE_HEADER_ESCALA)) { modo = "escala"; continue; }
+        if (modo === "item") {
+          const descricao = row[1] !== null && row[1] !== undefined ? String(row[1]).trim() : "";
+          const valor = toNum(row[2], null);
+          if (descricao && valor !== null) items.push({ descricao, valor });
+        } else if (modo === "escala") {
+          const de = toNum(row[1], null);
+          const ateRaw = row[2];
+          const ate = typeof ateRaw === "string" && ateRaw.trim() === "-" ? Infinity : toNum(ateRaw, Infinity);
+          const valor = toNum(row[3], null);
+          if (de !== null && valor !== null) regressiva.push({ de, ate, valor });
+        }
+        // Linhas de título de seção (só a coluna A preenchida, ex.: "9) DO
+        // TARIFÁRIO DA OPERAÇÃO", "ÍNDICES DE REAJUSTE 2026") e a tabela de
+        // índices (INPC/IGPM/IPCA, que não é custo de serviço) caem aqui
+        // sem cair em nenhum "modo" ainda aberto — ignoradas de propósito.
+      }
+    }
+    regressiva.sort((a, b) => a.de - b.de);
+    return { items, regressiva };
+  }
+
   async function loadTarifaTable(file, warnings) {
     const wb = await readWorkbook(file);
     let target = null;
@@ -1295,22 +1358,31 @@ https://github.com/nodeca/pako/blob/main/LICENSE
         break;
       }
     }
-    if (!target) {
-      warnings.push("Arquivo de tarifas: não foi encontrada a coluna 'Tarifa que UNILOG aplicou' em nenhuma aba — validação de custo não será feita.");
-      return [];
+    if (target) {
+      const idx = indexMap(target.header);
+      const out = [];
+      for (const row of target.rows.slice(1)) {
+        const desc = idx["Descrição dos serviços prestados"] !== undefined ? row[idx["Descrição dos serviços prestados"]] : null;
+        if (!desc) continue;
+        out.push({
+          descricao: String(desc).trim(),
+          tarifaAtual: idx["Tarifa Atual"] !== undefined ? row[idx["Tarifa Atual"]] : null,
+          tarifaUnilog: idx["Tarifa que UNILOG aplicou"] !== undefined ? row[idx["Tarifa que UNILOG aplicou"]] : null,
+        });
+      }
+      return out;
     }
-    const idx = indexMap(target.header);
-    const out = [];
-    for (const row of target.rows.slice(1)) {
-      const desc = idx["Descrição dos serviços prestados"] !== undefined ? row[idx["Descrição dos serviços prestados"]] : null;
-      if (!desc) continue;
-      out.push({
-        descricao: String(desc).trim(),
-        tarifaAtual: idx["Tarifa Atual"] !== undefined ? row[idx["Tarifa Atual"]] : null,
-        tarifaUnilog: idx["Tarifa que UNILOG aplicou"] !== undefined ? row[idx["Tarifa que UNILOG aplicou"]] : null,
-      });
+    // Não é a planilha de conciliação da Sallve — tenta o formato oficial
+    // do Informativo de Reajuste da Unilog (ver parseUnilogReajusteOficial).
+    const { items, regressiva } = parseUnilogReajusteOficial(wb);
+    if (items.length) {
+      const out = items.map((it) => ({ descricao: it.descricao, tarifaAtual: it.valor, tarifaUnilog: it.valor }));
+      out.regressiva = regressiva; // ver uso em validate() — tabela por faixa de volume de NF
+      warnings.push(`Arquivo de tarifas: reconhecido como Informativo de Reajuste oficial da Unilog — ${items.length} item(ns) de tarifa fixa${regressiva.length ? ` + tabela regressiva por Nota Fiscal (${regressiva.length} faixa(s))` : ""} carregado(s), usando a coluna "Valor atual" (já é o valor vigente/reajustado). (Aviso informativo, não é um erro.)`);
+      return out;
     }
-    return out;
+    warnings.push("Arquivo de tarifas: não reconheci nem a planilha de conciliação ('Tarifa que UNILOG aplicou') nem o Informativo de Reajuste oficial da Unilog ('Item/Descrição/Valor atual') em nenhuma aba — validação de custo não será feita.");
+    return [];
   }
 
   function resolveTarifaValue(entry) {
@@ -1372,6 +1444,21 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     return Object.assign({ score: bestScore }, best);
   }
 
+  // "4.2 Tabela regressiva por Nota Fiscal, expedida/mês" (ver
+  // parseUnilogReajusteOficial) — preço por NF que cai conforme o volume de
+  // NFs expedidas naquele mês. Não é um valor fixo por item como as demais
+  // tarifas, por isso tem sua própria função de faixa (mesmo padrão do
+  // Frete Peso da FSL: acha a faixa [de, até] que contém a quantidade
+  // faturada naquele mês).
+  function ehServicoPorNotaFiscalExpedida(codigo) {
+    const n = normalizeText(codigo);
+    return n.includes("nota fiscal") && (n.includes("expedid") || n.includes("escala") || n.includes("regressiv"));
+  }
+  function encontrarFaixaRegressivaUnilog(qtde, tiers) {
+    if (!Array.isArray(tiers) || !tiers.length || qtde === null || qtde === undefined) return null;
+    return tiers.find((t) => qtde >= t.de && qtde <= t.ate) || null;
+  }
+
   const UNILOG = {
     id: "unilog",
     label: "Unilog",
@@ -1408,7 +1495,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
         accept: ".xlsx,.xls",
         multiple: false,
         required: false,
-        desc: "Planilha com a coluna 'Tarifa que UNILOG aplicou', usada apenas para checar consistência fatura x tarifa aplicada (não é a negociação comercial).",
+        desc: "Aceita dois formatos: a planilha de conciliação da Sallve (coluna 'Tarifa que UNILOG aplicou') OU o Informativo de Reajuste oficial da Unilog (planilha, não o PDF — ex.: aba 'Reajuste 2026'), reconhecido automaticamente. Usada só para checar consistência fatura x tarifa vigente (não é a negociação comercial).",
       },
     ],
 
@@ -1455,7 +1542,20 @@ https://github.com/nodeca/pako/blob/main/LICENSE
       // ---- Cost check ----
       const resumoOut = resumoRows.map((svc) => {
         let status, tarifaEsperada = null, desvioPct = null, matchedDesc = null, matchScore = null;
-        if (!tarifaTable.length) {
+        // Tabela regressiva por Nota Fiscal expedida/mês (só existe quando a
+        // planilha de tarifas é o Informativo de Reajuste oficial da Unilog
+        // — ver parseUnilogReajusteOficial/loadTarifaTable): o preço por NF
+        // depende do volume faturado no mês, não é um valor fixo, então tem
+        // prioridade sobre o casamento genérico por palavra-chave.
+        const faixaRegressiva = tarifaTable.regressiva && tarifaTable.regressiva.length && ehServicoPorNotaFiscalExpedida(svc.codigo)
+          ? encontrarFaixaRegressivaUnilog(svc.qtde, tarifaTable.regressiva)
+          : null;
+        if (faixaRegressiva) {
+          tarifaEsperada = faixaRegressiva.valor;
+          matchedDesc = `Tabela regressiva por Nota Fiscal expedida/mês — faixa ${faixaRegressiva.de}–${faixaRegressiva.ate === Infinity ? "acima" : faixaRegressiva.ate} NF (tarifa ${fmtNumber(faixaRegressiva.valor)}/NF pelo volume de ${svc.qtde ?? "?"} NF cobradas nesta fatura)`;
+          desvioPct = tarifaEsperada > 0 ? (svc.valorUnitario - tarifaEsperada) / tarifaEsperada : 0;
+          status = Math.abs(desvioPct) > TOLERANCIA_PADRAO ? "DIVERGENTE" : "CORRETO";
+        } else if (!tarifaTable.length) {
           status = "SEM_PLANILHA_TARIFA";
         } else {
           const match = matchTarifa(svc.codigo, tarifaTable);
@@ -2486,10 +2586,18 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     label: "Parâmetros FSL — edite livremente, fica salvo neste navegador",
     groups: [
       {
-        title: "Quiosques — valor mensal acordado",
+        title: "Quiosques — valor por data de abastecimento",
         fields: [
-          { key: "quiosqueValorRJ", label: "Quiosques RJ (R$/mês)", default: 3770, source: "Passado por escrito (ago/2026)" },
-          { key: "quiosqueValorMG", label: "Quiosques MG (R$/mês)", default: 3770, source: "Passado por escrito (ago/2026)" },
+          // Kate, 19/09/2026, 2ª correção: "acho que dessa forma o sistema
+          // não conseguiu entender o raciocínio no cálculo. Então, vamos
+          // ajustar para cada datas iguais de abastecimento o valor da soma
+          // de cada data deve ser 942,44" — não é um valor semanal/quinzenal
+          // agregado: é o valor esperado para CADA DATA de abastecimento
+          // (pode haver um ou mais CT-e/DC na mesma data; a soma deles
+          // naquela data é que precisa bater com 942,44). Ver agrupamento
+          // por (UF, data) logo abaixo, em vez do total do período.
+          { key: "quiosqueValorRJ", label: "Quiosques RJ (R$ por data de abastecimento)", default: 942.44, source: "Passado por escrito (Kate, 19/09/2026) — comparado contra a soma cobrada em cada data de abastecimento (agrupando os CT-e/DC daquela data), não contra o total do período" },
+          { key: "quiosqueValorMG", label: "Quiosques MG (R$ por data de abastecimento)", default: 942.44, source: "Passado por escrito (Kate, 19/09/2026) — comparado contra a soma cobrada em cada data de abastecimento (agrupando os CT-e/DC daquela data), não contra o total do período" },
         ],
       },
       {
@@ -2501,23 +2609,31 @@ https://github.com/nodeca/pako/blob/main/LICENSE
       {
         title: "Ajustes do validador (não vêm da FSL)",
         fields: [
-          { key: "advMinimo", label: "Mínimo Advalorem (R$/CT-e) — NÃO CONFIRMADO", default: 0, source: "Não consta na tabela nova; era R$5,20 — confirmar com a FSL" },
           { key: "toleranciaArredondamento", label: "Tolerância de arredondamento (R$)", default: 0.5, source: "Critério interno — armadilhas.md item 10 (reduzida de R$1,00 para R$0,50 a pedido da Kate, 10/09/2026: \"a FSL não tem tolerância de 2%, precisa ser o custo preciso conforme tabela de fretes\")" },
-          // PIS/COFINS não constam na tabela de frete da FSL (só ICMS, coluna
-          // "ALIQ %" da própria fatura) — descobertos batendo a aritmética de
-          // CT-es reais da fatura BTC Q2/ago-26 (Kate, 04/09/2026: "cruzamento
-          // coluna por coluna para chegar no FRETE TOTAL"): em toda linha
-          // testada, Fiscal/Base de cálculo = (soma de todos os componentes
-          // cobrados) ÷ (1 − ALIQ% − 1,65% − 7,60%), sempre com essas duas
-          // taxas fixas. Editável aqui só até confirmar oficialmente com a
-          // FSL/fiscal — não é um valor que a FSL declara em lugar nenhum da
-          // fatura ou da tabela.
-          { key: "pisPct", label: "PIS no gross-up do Frete Total (%) — NÃO CONFIRMADO", default: 1.65, source: "Não consta na fatura nem na tabela da FSL — inferido batendo a aritmética de faturas reais (04/09/2026). Confirmar com a FSL/fiscal." },
-          { key: "cofinsPct", label: "COFINS no gross-up do Frete Total (%) — NÃO CONFIRMADO", default: 7.60, source: "Mesma origem do PIS acima — inferido, não confirmado oficialmente com a FSL." },
         ],
       },
     ],
   };
+  // Mínimo de Advalorem, PIS e COFINS (gross-up do Frete Total) deixaram de
+  // ser parâmetros editáveis (Kate, 19/09/2026: "vc pode excluir do sistema
+  // esses Ajustes do validador (não vêm da FSL) e manter apenas o Tolerância
+  // de arredondamento. Pois os demais valores vc deve comparar entre a
+  // fatura x tabela de frete") — ficam fixos no código, com o mesmo valor que
+  // já era o default:
+  // - FSL_ADV_MINIMO: a tabela nova não traz mínimo de Advalorem explícito
+  //   (era R$5,20 na tabela anterior); fica em R$0 até a FSL confirmar um
+  //   valor novo.
+  // - FSL_PIS_PCT / FSL_COFINS_PCT: não constam na tabela de frete da FSL
+  //   (só ICMS, coluna "ALIQ %" da própria fatura) — descobertos batendo a
+  //   aritmética de CT-es reais da fatura BTC Q2/ago-26 (Kate, 04/09/2026:
+  //   "cruzamento coluna por coluna para chegar no FRETE TOTAL"): em toda
+  //   linha testada, Fiscal/Base de cálculo = (soma de todos os componentes
+  //   cobrados) ÷ (1 − ALIQ% − 1,65% − 7,60%), sempre com essas duas taxas
+  //   fixas. Ainda NÃO confirmado oficialmente com a FSL/fiscal — se a FSL
+  //   confirmar um valor diferente, atualize as constantes abaixo.
+  const FSL_ADV_MINIMO = 0;
+  const FSL_PIS_PCT = 1.65;
+  const FSL_COFINS_PCT = 7.6;
   // Pedágio, mínimo GRIS, TAS, Taxa de Despacho, % de Reentrega e mínimo de
   // Reentrega são taxas da FSL — em vez de duplicá-las aqui, o validador lê
   // direto da aba "Generalidades" da tabela de frete carregada a cada
@@ -2779,6 +2895,26 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     return ultimoValor + (peso - ultimoLimite) * (entry.freteExc || 0);
   }
 
+  // Régua de região por MUNICÍPIO (não por nome parecido/heurística) — Kate,
+  // 19/09/2026: "vale montar a régua de região por município, não por nome.
+  // Os casos são os que têm nome parecido com capital ou ficam em região
+  // metropolitana [...] vc deve considerar apenas Capital para o que é
+  // capital e o que for qualquer outro município [...] entra em Interior ou
+  // G-Grande". Município aqui NUNCA é tratado como capital (isso já é
+  // garantido pela comparação exata acima); esta régua só resolve, de forma
+  // determinística, QUAL linha não-capital (G-Grande, a de região
+  // metropolitana) se aplica, para não depender do Frete Peso declarado nem
+  // cair em revisão manual nos UFs com 2+ sub-categorias. Lista inicial com
+  // os municípios que a Kate trouxe — adicione outros aqui conforme
+  // aparecerem, sem precisar mexer na lógica abaixo.
+  const FSL_MUNICIPIOS_METROPOLITANOS = {
+    SC: ["sao jose"], // Região Metropolitana de Florianópolis
+    SP: ["sao bernardo", "sao bernardo do campo"], // Região Metropolitana de São Paulo
+    MG: ["contagem"], // Região Metropolitana de Belo Horizonte
+    PE: ["olinda"], // Região Metropolitana de Recife
+    BA: ["lauro de freitas"], // Região Metropolitana de Salvador
+  };
+
   // Só resolve a região com segurança quando é a capital do estado — as
   // demais categorias (Interior / Grande porte / Interior 2 / Fluvial) não
   // têm um mapa de cidade->categoria disponível. Ver nota no topo do módulo.
@@ -2811,6 +2947,21 @@ https://github.com/nodeca/pako/blob/main/LICENSE
       if (key.startsWith(`${ufU}|`)) entriesDoUf.push(val);
     }
     const naoCapital = entriesDoUf.filter((e) => !["c-capital", "capital"].includes(normalizeText(e.regiao)));
+    // Régua de município (ver FSL_MUNICIPIOS_METROPOLITANOS acima) tem
+    // prioridade sobre a eliminação/Frete Peso: se o município já é um caso
+    // conhecido de região metropolitana da capital, usa direto a linha
+    // "G-Grande"/metropolitana daquele UF, sem depender de quantas
+    // sub-categorias a tabela tiver.
+    const municipiosMetro = FSL_MUNICIPIOS_METROPOLITANOS[ufU] || [];
+    if (municipiosMetro.includes(normalizeText(cidade))) {
+      const metro = naoCapital.find((e) => normalizeText(e.regiao).includes("grande"));
+      if (metro) {
+        return { entry: metro, motivo: null, resolvidoPorRegua: true };
+      }
+      // Régua indica metropolitana, mas essa tabela não tem uma linha
+      // "G-Grande" para o UF — cai pro fluxo normal abaixo (elimination ou
+      // Frete Peso), sem travar a linha.
+    }
     if (naoCapital.length === 1) {
       return { entry: naoCapital[0], motivo: null, resolvidoPorEliminacao: true };
     }
@@ -2941,14 +3092,14 @@ https://github.com/nodeca/pako/blob/main/LICENSE
       return { esperado: null, motivo: `Não validado — a tabela de frete não informa: ${nomes}. Corrija a aba "Generalidades" e reenvie para validar esta linha.` };
     }
     const peso = row.peso || 0;
-    const { entry, motivo, resolvidoPorEliminacao, resolvidoPorFretePeso } = resolverLinhaTabelaFSL(tabela, row.destUf, row.destCidade, { peso, freteFaturaDeclarado: row.fretePesoFatura });
+    const { entry, motivo, resolvidoPorEliminacao, resolvidoPorFretePeso, resolvidoPorRegua } = resolverLinhaTabelaFSL(tabela, row.destUf, row.destCidade, { peso, freteFaturaDeclarado: row.fretePesoFatura });
     if (!entry) return { esperado: null, motivo };
     const fretePeso = calcularFretePesoTabela(entry, peso);
     // Pedágio/GRIS mínimo/TAS/Taxa de Despacho vêm da aba Generalidades da
     // própria tabela de frete carregada — só o mínimo de Advalorem (não
     // informado pela FSL nesta tabela) fica no painel de Parâmetros.
     const pedagio = (generalidades.pedagioPorFracao100kg || 0) * Math.ceil(peso / 100 || 0);
-    const adv = Math.max(params.advMinimo || 0, (row.valorNF || 0) * (entry.advPct / 100));
+    const adv = Math.max(FSL_ADV_MINIMO, (row.valorNF || 0) * (entry.advPct / 100));
     const gris = Math.max(generalidades.grisMinimo || 0, (row.valorNF || 0) * (entry.grisPct / 100));
     const tas = generalidades.tasPorCte || 0;
     const taxaDespacho = generalidades.taxaDespachoPorCte || 0;
@@ -2974,8 +3125,8 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     // sistematicamente abaixo do Frete Total cobrado em toda fatura real
     // testada.
     const aliqIcms = (row.aliqPct || 0) / 100;
-    const aliqPis = (params.pisPct || 0) / 100;
-    const aliqCofins = (params.cofinsPct || 0) / 100;
+    const aliqPis = FSL_PIS_PCT / 100;
+    const aliqCofins = FSL_COFINS_PCT / 100;
     const aliqTotal = aliqIcms + aliqPis + aliqCofins;
     const total = aliqTotal < 1 ? subtotal / (1 - aliqTotal) : subtotal;
     // Confere CADA componente cobrado na própria fatura (quando a coluna
@@ -3006,7 +3157,9 @@ https://github.com/nodeca/pako/blob/main/LICENSE
       // "se não for Capital, valide na outra linha Interior ou G-Grande" —
       // a linha já É validada normalmente, isso só documenta qual linha da
       // tabela foi usada, pra auditoria).
-      motivo: resolvidoPorEliminacao
+      motivo: resolvidoPorRegua
+        ? `Região usada: "${entry.regiao}" (${entry.uf}) — "${row.destCidade}" está na régua de municípios de região metropolitana da capital (Kate, 19/09/2026), então cai direto nessa linha independente do Frete Peso.`
+        : resolvidoPorEliminacao
         ? `Região usada: "${entry.regiao}" (${entry.uf}) — cidade não é a capital, e essa é a única linha não-capital dessa UF na tabela.`
         : resolvidoPorFretePeso
         ? `Região usada: "${entry.regiao}" (${entry.uf}) — identificada pelo "Frete Peso" que a própria FSL já declarou na fatura (${fmtMoney(row.fretePesoFatura)} para ${peso}kg bate com essa linha da tabela).`
@@ -3399,8 +3552,14 @@ https://github.com/nodeca/pako/blob/main/LICENSE
 
       // ---- Quiosques ---- (declaração de conteúdo nunca existe no SAP —
       // não entra no cruzamento; as demais são tratadas como saída)
+      // Agrupamento por (UF, DATA de abastecimento): a soma dos CT-e/DC de
+      // uma mesma data precisa bater com o valor acordado daquela UF (Kate,
+      // 19/09/2026 — ver comentário nos parâmetros acima). Usa "DATA FRETE"
+      // (data em que o abastecimento efetivamente ocorreu) e cai para "DATA
+      // CT-E" (emissão) só quando a fatura não trouxer a primeira.
       const quiosqueRows = [];
-      const quiosqueTotais = {};
+      const quiosqueTotais = {}; // por UF (só para o KPI de total geral)
+      const quiosqueGruposPorData = {}; // chave `${uf}|${data}` -> { uf, data, total, qtd }
       if (wsQuiosqueList.length) {
         for (const { name: nomeAbaQuiosque, ws: wsQuiosque } of wsQuiosqueList) {
           const { rows, naoEncontrados } = parseFSLAba(wsQuiosque, `Quiosques (${nomeAbaQuiosque})`, false);
@@ -3417,9 +3576,14 @@ https://github.com/nodeca/pako/blob/main/LICENSE
             const uf = String(row.destUf || row.remUf || "").toUpperCase() || "?";
             const isLancamento = normalizeText(row.tipo).includes("lancamento") || normalizeText(row.classificacaoDescricao || "").includes("lancamento") || normalizeText(row.obs || "").includes("lancamento");
             const valorConsiderado = row.freteTotal || 0;
+            const dataAbastecimento = row.dataFrete || row.dataCte || null;
             quiosqueTotais[uf] = (quiosqueTotais[uf] || 0) + valorConsiderado;
+            const chaveData = `${uf}|${dataAbastecimento || "SEM DATA"}`;
+            if (!quiosqueGruposPorData[chaveData]) quiosqueGruposPorData[chaveData] = { uf, data: dataAbastecimento, total: 0, qtd: 0 };
+            quiosqueGruposPorData[chaveData].total += valorConsiderado;
+            quiosqueGruposPorData[chaveData].qtd += 1;
             quiosqueRows.push({
-              "CT-E/DC": row.cte || row.nf, UF: uf, Tipo: isLancamento ? "Lançamento (2x)" : "Padrão",
+              "CT-E/DC": row.cte || row.nf, UF: uf, Data: dataAbastecimento || "sem data na fatura", Tipo: isLancamento ? "Lançamento (2x)" : "Padrão",
               EhDeclaracaoConteudo: isDC ? "sim" : "não",
               StatusSAP: isDC ? "N/A (declaração de conteúdo)" : statusSapSaida(row.nf),
               ValorCobrado: round2(valorConsiderado),
@@ -3429,17 +3593,20 @@ https://github.com/nodeca/pako/blob/main/LICENSE
       } else {
         warnings.push("Aba de Quiosques não encontrada no relatório enviado (procurei por abas com 'quiosque' ou 'abastec' no nome).");
       }
-      const quiosqueEsperadoPorUf = { RJ: params.quiosqueValorRJ, MG: params.quiosqueValorMG };
-      const quiosqueResumoRows = Object.keys(quiosqueTotais).map((uf) => {
-        const esperado = quiosqueEsperadoPorUf[uf];
-        const cobrado = round2(quiosqueTotais[uf]);
-        const escopoNovo = esperado === undefined;
-        return {
-          UF: uf, TotalCobrado: cobrado, ValorAcordado: esperado !== undefined ? esperado : null,
-          Desvio: esperado !== undefined ? round2(cobrado - esperado) : null,
-          Situacao: escopoNovo ? "ESCOPO NOVO — aprovar/negociar" : (Math.abs(cobrado - esperado) <= 1 ? "OK" : "DIVERGENTE"),
-        };
-      });
+      const quiosqueValorPorUf = { RJ: params.quiosqueValorRJ, MG: params.quiosqueValorMG };
+      const quiosqueResumoRows = Object.values(quiosqueGruposPorData)
+        .sort((a, b) => (a.uf === b.uf ? String(a.data).localeCompare(String(b.data)) : a.uf.localeCompare(b.uf)))
+        .map((g) => {
+          const esperado = quiosqueValorPorUf[g.uf];
+          const cobrado = round2(g.total);
+          const escopoNovo = esperado === undefined;
+          return {
+            UF: g.uf, Data: g.data || "sem data na fatura", "CT-e/DC nesta data": g.qtd, TotalCobrado: cobrado,
+            ValorAcordadoPorData: esperado !== undefined ? esperado : null,
+            Desvio: esperado !== undefined ? round2(cobrado - esperado) : null,
+            Situacao: escopoNovo ? "ESCOPO NOVO — aprovar/negociar" : (Math.abs(cobrado - esperado) <= 1 ? "OK" : "DIVERGENTE"),
+          };
+        });
 
       // ---- KPIs ----
       const totalCteCobrado = sum(cteRows.map((r) => r.FreteCobrado));
@@ -3469,7 +3636,36 @@ https://github.com/nodeca/pako/blob/main/LICENSE
         { label: "Sell Out — total cobrado", value: fmtMoney(totalSelloutCobrado), tone: "neutral", desc: "Soma da coluna FreteCobrado da aba Sell Out - Análise.", group: "Sell Out" },
         { label: "Sell Out — total esperado", value: fmtMoney(totalSelloutEsperado), tone: "neutral", desc: "Soma do frete recalculado pela tabela — só linhas classificáveis (capital).", group: "Sell Out" },
         { label: "Sell Out — requer classificação manual", value: selloutRevisar, tone: selloutRevisar ? "warning" : "good", desc: "CT-e cujo destino não é a capital do estado — a tabela nova tem sub-categorias de interior sem mapa de cidade->categoria disponível.", group: "Sell Out" },
-        { label: "Quiosques — total cobrado", value: fmtMoney(totalQuiosques), tone: "neutral", desc: "Soma de todos os CT-e/DC de quiosque no relatório, por UF.", group: "Quiosques" },
+        { label: "Quiosques — total cobrado (todos os UFs)", value: fmtMoney(totalQuiosques), tone: "neutral", desc: "Soma de todos os CT-e/DC de quiosque no relatório, somando todos os UFs e todas as datas — ver os indicadores por UF abaixo e a aba \"Quiosques - Resumo por Data\" para o detalhe data a data.", group: "Quiosques" },
+        ...Object.entries(
+          // Agrega as linhas por-data (quiosqueResumoRows) de volta por UF só
+          // para o card-resumo — o detalhe de cada data fica na aba de
+          // exportação, não teria espaço legível pra uma linha por data aqui
+          // se o mês tiver várias entregas.
+          quiosqueResumoRows.reduce((acc, r) => {
+            if (!acc[r.UF]) acc[r.UF] = { ok: 0, divergente: 0, escopoNovo: 0, cobrado: 0, esperado: 0, desvioAbs: 0 };
+            const g = acc[r.UF];
+            g.cobrado += r.TotalCobrado;
+            if (r.Situacao === "OK") g.ok += 1;
+            else if (r.Situacao === "DIVERGENTE") { g.divergente += 1; g.desvioAbs += Math.abs(r.Desvio); }
+            else g.escopoNovo += 1;
+            if (r.ValorAcordadoPorData !== null) g.esperado += r.ValorAcordadoPorData;
+            return acc;
+          }, {})
+        ).map(([uf, g]) => {
+          const totalDatas = g.ok + g.divergente + g.escopoNovo;
+          const todasEscopoNovo = g.escopoNovo === totalDatas;
+          const temDivergencia = g.divergente > 0;
+          return {
+            label: `Quiosques ${uf} — datas de abastecimento`,
+            value: todasEscopoNovo ? `${totalDatas} data(s) — escopo novo` : `${g.ok}/${totalDatas} data(s) OK`,
+            tone: todasEscopoNovo ? "warning" : temDivergencia ? "critical" : "good",
+            desc: todasEscopoNovo
+              ? `${totalDatas} data(s) de abastecimento em ${uf} cobrada(s), mas sem valor acordado nos Parâmetros para essa UF — escopo novo, não é divergência de cobrança: aprove/negocie o valor e cadastre em Parâmetros.`
+              : `Cada data de abastecimento em ${uf} deve somar o valor acordado nos Parâmetros (comparação por data, não por período — Kate, 19/09/2026). Cobrado no total: ${fmtMoney(g.cobrado)}; esperado no total: ${fmtMoney(g.esperado)}.${temDivergencia ? ` ${g.divergente} data(s) fora da tolerância, somando ${fmtMoney(g.desvioAbs)} de desvio.` : ""} Ver a aba "Quiosques - Resumo por Data" para o detalhe de cada data.`,
+            group: "Quiosques",
+          };
+        }),
         { label: "NF localizadas no SAP", value: totalComSapAvaliavel ? `${localizadas}/${totalComSapAvaliavel}` : "—", tone: naoLocalizadas ? "warning" : "good", desc: "Soma das 3 abas (CTE + Sell Out + Quiosques, excluindo declaração de conteúdo de quiosque, que nunca existe no SAP) — quantas NFs cobradas foram encontradas na base SAP enviada.", group: "Conferência SAP" },
         { label: "NF não localizadas/lançadas no SAP", value: naoLocalizadas, tone: naoLocalizadas ? "critical" : "good", desc: "NF cobrada pela FSL (em qualquer das 3 abas) que não foi encontrada na base SAP enviada — sem documento, o frete não se aprova (ver 'Situação: Saída não localizada' na skill).", group: "Conferência SAP" },
         { label: "Linhas sem NF para cruzar", value: semNf, tone: semNf ? "warning" : "good", desc: "Linhas em que não havia um número de NF para tentar casar com o SAP (célula vazia, ou a coluna de NF não foi reconhecida na fatura — ver aviso acima).", group: "Conferência SAP" },
@@ -3479,9 +3675,9 @@ https://github.com/nodeca/pako/blob/main/LICENSE
       notes.push("O cruzamento com o SAP agora cobre as 3 abas (CTE, Sell Out e Quiosques), sempre casando pelo número da NF (nunca pelo CT-e) — ver a coluna StatusSAP em cada aba e o grupo 'Conferência SAP' nos indicadores.");
       notes.push("CT-e (CTE ou Sell Out) com destino fora da capital do estado são validados pela linha não-capital daquele UF na tabela (Kate, 10/09/2026). Na tabela atual isso é direto pra quase todo UF, que só tem capital + 1 outra linha — a coluna 'Observação' de cada linha registra qual linha da tabela foi usada, só como auditoria, não como ressalva. Só cai em 'REVISAR MANUALMENTE'/'AVALIAR' o caso raro de UF com 2+ linhas não-capital (ex.: PA) cujo Frete Peso da fatura não bateu com exatamente uma delas.");
       notes.push('Cada custo cobrado na fatura (Frete Peso, Pedágio, ADV, GRIS, TAS, Seguro, SUFRAMA, Taxa de Despacho, e Entrega quando cobrada) agora é conferido separadamente contra a tabela FSL — não só o Frete Total agregado (Kate, 04/09/2026: "cruzamento coluna por coluna", "valide taxa com a tabela da FSL, até mesmo as generalidades"). Ver as colunas "...Cobrado"/"...Esperado" e a coluna "ItensDivergentes" (lista qual custo não bateu e por quanto) nas abas CTE e Sell Out. Quando a fatura não tem a coluna daquele custo, ele fica "—" (não verificável) em vez de forçar um resultado. Notas 4 Elos (CNPJ pagador RJ + "4 ELOS" no nome) não têm essa quebra: usam só o percentual sobre a NF, não a tabela por Frete Peso.');
-      notes.push('O valor esperado de cada linha agora reconcilia com o FRETE TOTAL da fatura via gross-up de 3 impostos — ICMS (coluna "ALIQ %" da própria linha) + PIS + COFINS —, não só ICMS como antes. PIS (1,65%) e COFINS (7,60%) não constam em nenhuma coluna da fatura nem da tabela FSL: foram inferidos batendo a aritmética de CT-es reais (Fiscal/Base de cálculo = soma dos componentes ÷ (1 − ICMS% − PIS% − COFINS%), consistente em todas as linhas testadas) — ainda NÃO confirmados oficialmente com a FSL/fiscal, editáveis no painel de Parâmetros. A coluna "BaseCalculoFatura" mostra o valor que a própria FSL declarou, para conferência visual contra o "FreteEsperado" calculado aqui.');
-      if (params.advMinimo === 0) {
-        notes.push("O mínimo de Advalorem está zerado nos parâmetros porque a tabela nova não traz esse valor explicitamente (era R$5,20 na tabela anterior). Confirme com a FSL e ajuste no painel de Parâmetros se ainda valer.");
+      notes.push(`O valor esperado de cada linha agora reconcilia com o FRETE TOTAL da fatura via gross-up de 3 impostos — ICMS (coluna "ALIQ %" da própria linha) + PIS + COFINS —, não só ICMS como antes. PIS (${FSL_PIS_PCT}%) e COFINS (${FSL_COFINS_PCT}%) não constam em nenhuma coluna da fatura nem da tabela FSL: foram inferidos batendo a aritmética de CT-es reais (Fiscal/Base de cálculo = soma dos componentes ÷ (1 − ICMS% − PIS% − COFINS%), consistente em todas as linhas testadas) — ainda NÃO confirmados oficialmente com a FSL/fiscal, fixos no código (não são mais editáveis no painel de Parâmetros — Kate, 19/09/2026). A coluna "BaseCalculoFatura" mostra o valor que a própria FSL declarou, para conferência visual contra o "FreteEsperado" calculado aqui.`);
+      if (FSL_ADV_MINIMO === 0) {
+        notes.push("O mínimo de Advalorem está fixado em R$0 porque a tabela nova não traz esse valor explicitamente (era R$5,20 na tabela anterior). Avise se a FSL confirmar um valor novo para ajustar no código.");
       }
 
       // ---- SUFRAMA fora do AM — regra passada por escrito pela Kate
@@ -3522,7 +3718,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
       const tables = {
         "CTE - Análise": { rows: cteRows, statusCols: { Situacao: (v) => (v === "OK" ? "ok" : v === "ACIMA" ? "bad" : v === "ABAIXO" ? "warn" : "neutral"), StatusSAP: statusSapBadge, ItensDivergentes: itensDivergentesBadge } },
         "Sell Out - Análise": { rows: selloutRows, statusCols: { Situacao: (v) => (v === "OK" ? "ok" : v === "REVISAR MANUALMENTE" ? "warn" : "bad"), StatusSAP: statusSapBadge, ItensDivergentes: itensDivergentesBadge } },
-        "Quiosques - Resumo por UF": { rows: quiosqueResumoRows, statusCols: { Situacao: (v) => (v === "OK" ? "ok" : v.startsWith("ESCOPO") ? "warn" : "bad") } },
+        "Quiosques - Resumo por Data": { rows: quiosqueResumoRows, statusCols: { Situacao: (v) => (v === "OK" ? "ok" : v.startsWith("ESCOPO") ? "warn" : "bad") } },
         "Quiosques - Análise": { rows: quiosqueRows, statusCols: { StatusSAP: statusSapBadge } },
       };
 
