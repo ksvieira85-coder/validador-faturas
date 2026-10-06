@@ -427,6 +427,12 @@ https://github.com/nodeca/pako/blob/main/LICENSE
   // base, sem precisar reenviar fatura/tabela/SAP).
   // ---------------------------------------------------------------------
 
+  // Nomes aceitos para a coluna de número do pedido (fatura e base de entregas).
+  // A fatura exportada direto do sistema da Diálogo traz "NrPedido" (Kate,
+  // 05/10/2026) — antes só "Numero do Pedido" era reconhecido, então nenhum
+  // pedido era lido da fatura e o cruzamento de devoluções ficava zerado.
+  const PEDIDO_COLUMN_CANDIDATES = ["Numero do Pedido", "Número do Pedido", "NumeroPedido", "NrPedido", "Nr Pedido", "Nr. Pedido", "Número Pedido", "Numero Pedido", "Pedido", "Nº Pedido", "N° Pedido", "No Pedido"];
+
   function normalizePedidoKey(v) {
     return v !== null && v !== undefined && String(v).trim() !== "" ? String(v).trim().toUpperCase() : null;
   }
@@ -438,7 +444,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
   // (findColumnIdx) em vez de exigir um cabeçalho exato.
   async function loadPedidosEntrega(files, warnings) {
     const map = new Map(); // key normalizado -> { pedido, notaFiscal, custoFreteEntrega }
-    const PEDIDO_CANDIDATES = ["Numero do Pedido", "Número do Pedido", "NumeroPedido", "Número Pedido", "Numero Pedido", "Pedido", "Nº Pedido", "N° Pedido", "No Pedido"];
+    const PEDIDO_CANDIDATES = PEDIDO_COLUMN_CANDIDATES;
     const FRETE_CANDIDATES = ["Custo Frete", "CustoFrete", "VlrFreteValor", "Valor Frete", "Valor do Frete", "Frete Cobrado", "VlrFreteCobrado", "Valor Total do Frete", "Frete", "Valor do Frete Cobrado"];
     const NF_CANDIDATES = ["Nota Fiscal", "NotaFiscal", "NF", "Número da Nota Fiscal", "Nr Nota Fiscal", "Número NF"];
     for (const f of files || []) {
@@ -448,6 +454,10 @@ https://github.com/nodeca/pako/blob/main/LICENSE
       // (Kate, 03/09/2026) para exportações reais com título acima do
       // cabeçalho ou em aba com outro nome.
       const achado = localizarTabelaComColunas(wb, [PEDIDO_CANDIDATES, FRETE_CANDIDATES]);
+      if (!achado && localizarTabelaComColunas(wb, [PEDIDO_CANDIDATES])) {
+        warnings.push(`O arquivo "${f.name}", enviado como base de frete de entrega, tem coluna de pedido mas NÃO tem coluna com o valor do frete (procurei 'Custo Frete', 'VlrFreteValor', 'Valor do Frete' e variações) — parece ser uma lista de devoluções, não a base de entregas. Por isso a comparação "devolução = 100% do frete da entrega original" ficou zerada. Para compará-la preciso de uma base com pedido + frete cobrado na ENTREGA original (ex.: a fatura do mês em que o pedido foi entregue). Se este arquivo é só a lista de devolvidos, envie-o no campo "Base de pedidos/notas" — aí cada linha de devolução da fatura é conferida contra ele.`);
+        continue;
+      }
       if (!achado) {
         warnings.push(`Arquivo "${f.name}" da base de pedidos de entrega não tem colunas reconhecíveis de número do pedido e/ou custo do frete (procurei em todas as abas, nas primeiras 15 linhas de cada uma) — ignorado. Renomeie a coluna de pedido para algo como "Numero do Pedido" e a de frete para algo como "Custo Frete", ou avise para ajustarmos o reconhecimento.`);
         continue;
@@ -563,7 +573,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     const somaDiferencasRelevantes = sum(relevantes.map((r) => r.DiferencaValor));
 
     const kpis = [
-      { label: "Linhas na base de entregas", value: totalBase, tone: "neutral", desc: "Total de pedidos lidos na base de frete de entrega enviada." },
+      { label: "Linhas na base de entregas", value: totalBase === 0 ? "0 — nenhum pedido lido (ver avisos)" : totalBase, tone: totalBase === 0 ? "critical" : "neutral", desc: "Total de pedidos lidos na base de frete de entrega enviada." },
       { label: "Localizadas como devolução", value: comparacao.length, tone: excluidos.length ? "warning" : "good", desc: "Pedidos da base de entregas que foram encontrados na planilha de validação com um TipoDocumento de devolução, e por isso entraram na comparação." },
       { label: "Excluídas da comparação", value: excluidos.length, tone: excluidos.length ? "warning" : "good", desc: "Pedidos da base de entregas que não foram encontrados na validação, ou que foram encontrados com um TipoDocumento diferente de devolução — ver a aba 'Excluídos' para o motivo de cada um." },
       { label: "Total Custo Frete (base de entregas)", value: fmtMoney(totalCustoFrete), tone: "neutral", desc: "Soma do custo de frete de entrega, só das linhas que entraram na comparação." },
@@ -925,6 +935,11 @@ https://github.com/nodeca/pako/blob/main/LICENSE
           if (!(col in idx2)) throw new Error(`Fatura: coluna obrigatória '${col}' não encontrada no cabeçalho.`);
         }
 
+        const pedidoColIdx = findColumnIdx(idx2, [cols.numeroPedido, ...PEDIDO_COLUMN_CANDIDATES].filter(Boolean));
+        if (pedidoColIdx === undefined) {
+          warnings.push("A fatura não tem coluna de número do pedido reconhecível (procurei 'Numero do Pedido', 'NrPedido', 'Pedido' e variações) — sem ela não dá para cruzar pedidos com a base de devoluções/entregas nem com a base Intelipost.");
+        }
+
         const results = [];
         for (const row of rows2.slice(1)) {
           if (!row || row.every((v) => v === null || v === undefined || v === "")) continue;
@@ -939,7 +954,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
           const vlrFreteValor = toNum(row[idx2[cols.vlrFreteValor]], 0);
           const vlrPedagio = cols.vlrPedagio ? toNum(row[idx2[cols.vlrPedagio]], 0) : 0;
           const vlrOutros = sum((cols.vlrOutrosColumns || []).map((c) => toNum(row[idx2[c]], 0)));
-          const numeroPedido = idx2[cols.numeroPedido] !== undefined ? row[idx2[cols.numeroPedido]] : null;
+          const numeroPedido = pedidoColIdx !== undefined ? row[pedidoColIdx] : null;
           const nrCte = idx2[cols.nrCte] !== undefined ? row[idx2[cols.nrCte]] : null;
           const nrCtrc = idx2[cols.nrCtrc] !== undefined ? row[idx2[cols.nrCtrc]] : null;
 
@@ -3189,7 +3204,10 @@ https://github.com/nodeca/pako/blob/main/LICENSE
         pisFatura: toNum(g("Fiscal/Valor PIS"), null),
         cofinsFatura: toNum(g("Fiscal/Valor COFINS"), null),
         classificacaoDescricao: g("Classificação/Descrição"),
-        aliqPct: toNum(g("ALIQ %"), 0),
+        // "ALIQ %" pode vir como fração formatada em % no Excel (0,12 = 12%)
+        // — nova versão do relatório (Kate, 06/10/2026) — ou como número
+        // inteiro de percentual (12). Alíquota ≤ 1 é tratada como fração.
+        aliqPct: (() => { const a = toNum(g("ALIQ %"), 0); return a > 0 && a <= 1 ? round2(a * 100) : a; })(),
         status: g("Status"),
         obs: g("OBS"),
       });
@@ -3203,7 +3221,11 @@ https://github.com/nodeca/pako/blob/main/LICENSE
   // Sell Out/tabela de frete, que são sempre uma aba.
   function findFSLSheets(wb, marcadores) {
     const lista = Array.isArray(marcadores) ? marcadores : [marcadores];
-    return wb.SheetNames.filter((n) => lista.some((m) => normalizeText(n).includes(m))).map((n) => ({ name: n, ws: wb.Sheets[n] }));
+    // Compara sem pontuação/espaço/hífen: a aba real da FSL é "CT-E" (com
+    // hífen) e antes não casava com o marcador "cte" — o relatório inteiro
+    // de Fretes CTE era ignorado (Kate, 06/10/2026).
+    const comp = (t) => normalizeText(t).replace(/[^a-z0-9]/g, "");
+    return wb.SheetNames.filter((n) => lista.some((m) => comp(n).includes(comp(m)))).map((n) => ({ name: n, ws: wb.Sheets[n] }));
   }
   function findFSLSheet(wb, marcadores) {
     const found = findFSLSheets(wb, marcadores);
@@ -3808,6 +3830,10 @@ https://github.com/nodeca/pako/blob/main/LICENSE
       const hasSapEntrada = !!(files.sapEntrada && files.sapEntrada.length);
       const sapSaidaSerials = new Set();
       const sapEntradaSerials = new Set();
+      // Faixa numérica coberta por cada arquivo de saída (uma por filial, numeração
+      // própria) — NF fora de todas as faixas é "base não cobre", não divergência
+      // da FSL (armadilhas: extração do SAP que cobre só parte do período).
+      const sapSaidaFaixas = [];
       if (hasSapSaida) {
         for (const f of files.sapSaida) {
           const wb = await readWorkbook(f);
@@ -3818,11 +3844,16 @@ https://github.com/nodeca/pako/blob/main/LICENSE
           // (não só a aba "Sheet" / linha 1) — exportações reais variam.
           const achado = localizarTabelaComColuna(wb, ["Serial do Documento", "Serial"]);
           if (!achado) { warnings.push(`Base SAP saída "${f.name}": não encontrei a coluna 'Serial do Documento' (nem 'Serial') em nenhuma aba (procurei nas primeiras 15 linhas de cada uma). Abas do arquivo: ${wb.SheetNames.join(", ")}.${avisoAbasComFalhaDeLeitura(wb)} Arquivo ignorado — confirme se é a exportação certa.`); continue; }
-          let carregados = 0;
+          let carregados = 0, faixaMin = Infinity, faixaMax = -Infinity;
           for (const r of achado.dataRows) {
             const n = normalizeNFKey(r[achado.colIdx]);
-            if (n) { sapSaidaSerials.add(n); carregados++; }
+            if (n) {
+              sapSaidaSerials.add(n); carregados++;
+              const num = Number(n);
+              if (Number.isFinite(num)) { if (num < faixaMin) faixaMin = num; if (num > faixaMax) faixaMax = num; }
+            }
           }
+          if (carregados > 0 && Number.isFinite(faixaMin)) sapSaidaFaixas.push({ arquivo: f.name, min: faixaMin, max: faixaMax });
           notes.push(`Base SAP saída "${f.name}": ${carregados} serial(is) carregado(s) da aba "${achado.sheetName}" (cabeçalho encontrado na linha ${achado.headerRowIdx + 1} do arquivo). Se uma NF que você sabe que está aí ainda aparecer como "não localizada", confira se o valor na planilha não tem algo além dos dígitos do número (a comparação ignora tudo que não é dígito e zeros à esquerda).`);
         }
       } else {
@@ -3859,7 +3890,12 @@ https://github.com/nodeca/pako/blob/main/LICENSE
         if (!hasSapSaida) return "SEM_BASE";
         const candidatos = expandirNFs(nf);
         if (!candidatos.length) return "SEM_NF";
-        return candidatos.some((n) => sapSaidaSerials.has(n)) ? "OK" : "NAO_LOCALIZADA";
+        if (candidatos.some((n) => sapSaidaSerials.has(n))) return "OK";
+        // Não achou: só é "não localizada" (divergência real) se a NF cai
+        // dentro da faixa de algum arquivo enviado; fora de todas as faixas a
+        // base simplesmente não cobre essa NF (extração incompleta).
+        const dentroDeAlgumaFaixa = candidatos.some((n) => { const v = Number(n); return sapSaidaFaixas.some((fx) => v >= fx.min && v <= fx.max); });
+        return dentroDeAlgumaFaixa ? "NAO_LOCALIZADA" : "FORA_DA_COBERTURA";
       }
       function statusSapEntrada(nf) {
         if (!hasSapEntrada) return "SEM_BASE";
@@ -4037,9 +4073,14 @@ https://github.com/nodeca/pako/blob/main/LICENSE
       // toda nota (CTE, Sell Out, Quiosques) exista no SAP, não só CTE.
       const todasComSap = [...cteRows.map((r) => r.StatusSAP), ...selloutRows.map((r) => r.StatusSAP), ...quiosqueRows.map((r) => r.StatusSAP)];
       const naoLocalizadas = todasComSap.filter((s) => s === "NAO_LOCALIZADA" || s === "NAO_LANCADA").length;
+      const foraDaCobertura = todasComSap.filter((s) => s === "FORA_DA_COBERTURA").length;
       const semNf = todasComSap.filter((s) => s === "SEM_NF").length;
       const localizadas = todasComSap.filter((s) => s === "OK").length;
       const totalComSapAvaliavel = todasComSap.filter((s) => s === "OK" || s === "NAO_LOCALIZADA" || s === "NAO_LANCADA").length;
+      if (foraDaCobertura > 0) {
+        const faixasTxt = sapSaidaFaixas.map((fx) => `${fx.arquivo}: ${fx.min}–${fx.max}`).join("; ");
+        warnings.push(`${foraDaCobertura} NF(s) de saída/transferência cobradas pela FSL ficaram FORA da faixa de numeração coberta pelas bases SAP de saída enviadas (${faixasTxt}) — provavelmente a extração do SAP não cobre o período inteiro (ex.: começa depois do início do mês). Elas NÃO foram contadas como "não localizadas": reextraia a base cobrindo o mês todo para conferi-las.`);
+      }
 
       const kpis = [
         { label: "Fretes CTE — total cobrado", value: fmtMoney(totalCteCobrado), tone: "neutral", desc: "Soma da coluna FreteCobrado da aba CTE - Análise.", group: "Fretes CTE" },
@@ -4082,6 +4123,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
         }),
         { label: "NF localizadas no SAP", value: totalComSapAvaliavel ? `${localizadas}/${totalComSapAvaliavel}` : "—", tone: naoLocalizadas ? "warning" : "good", desc: "Soma das 3 abas (CTE + Sell Out + Quiosques, excluindo declaração de conteúdo de quiosque, que nunca existe no SAP) — quantas NFs cobradas foram encontradas na base SAP enviada.", group: "Conferência SAP" },
         { label: "NF não localizadas/lançadas no SAP", value: naoLocalizadas, tone: naoLocalizadas ? "critical" : "good", desc: "NF cobrada pela FSL (em qualquer das 3 abas) que não foi encontrada na base SAP enviada — sem documento, o frete não se aprova (ver 'Situação: Saída não localizada' na skill).", group: "Conferência SAP" },
+        { label: "NF fora da cobertura da base de saída", value: foraDaCobertura, tone: foraDaCobertura ? "warning" : "good", desc: "NFs de saída/transferência cobradas cujo número está fora da faixa coberta pelos arquivos SAP de saída enviados — a base não cobre, então não dá para dizer se existem. Não é divergência da FSL: reextraia o SAP cobrindo o mês inteiro e rode de novo.", group: "Conferência SAP" },
         { label: "Linhas sem NF para cruzar", value: semNf, tone: semNf ? "warning" : "good", desc: "Linhas em que não havia um número de NF para tentar casar com o SAP (célula vazia, ou a coluna de NF não foi reconhecida na fatura — ver aviso acima).", group: "Conferência SAP" },
       ];
 
@@ -4127,7 +4169,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
         warnings.push(msg);
       }
 
-      const statusSapBadge = (v) => (v === "OK" ? "ok" : v === "SEM_BASE" || v === "SEM_NF" || (typeof v === "string" && v.startsWith("N/A")) ? "neutral" : "bad");
+      const statusSapBadge = (v) => (v === "OK" ? "ok" : v === "FORA_DA_COBERTURA" ? "warn" : v === "SEM_BASE" || v === "SEM_NF" || (typeof v === "string" && v.startsWith("N/A")) ? "neutral" : "bad");
       const itensDivergentesBadge = (v) => (v === "—" ? "neutral" : v === "" ? "ok" : "bad");
       const tables = {
         "CTE - Análise": { rows: cteRows, statusCols: { Situacao: (v) => (v === "OK" ? "ok" : v === "ACIMA" ? "bad" : v === "ABAIXO" ? "warn" : "neutral"), StatusSAP: statusSapBadge, ItensDivergentes: itensDivergentesBadge } },
