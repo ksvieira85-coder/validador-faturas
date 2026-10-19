@@ -270,6 +270,10 @@ https://github.com/nodeca/pako/blob/main/LICENSE
 (function () {
   "use strict";
 
+  // Unilog: tarifa unitária contratada tem 4 casas e a fatura repete esse valor
+  // exato — 2% escondia diferença de faixa da escala B2C (ex.: 2,8597 cobrado
+  // vs 2,8168 da faixa certa = 1,5%). Só tolera arredondamento (0,1%).
+  const UNILOG_TOLERANCIA_UNITARIO = 0.001;
   const TOLERANCIA_PADRAO = 0.02; // 2% — mesma tolerância validada manualmente
   const LIMITE_DIVERGENCIA_ABSOLUTA_PADRAO = 5.0; // R$ — a partir daqui, a diferença é sinalizada como relevante (SIM) na comparação devolução vs. entrega
 
@@ -640,6 +644,19 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     }
     const n = parseFloat(s);
     return Number.isNaN(n) ? null : n;
+  }
+
+  // Número que pode vir como texto no formato brasileiro, com símbolo de
+  // moeda e espaço não separável — ex.: "R$\u00a022,6715", "99,7000",
+  // "3.181.422,5599" (fatura Unilog RJ set/26). Antes só o parseFloat cru
+  // era usado: "99,7000" virava 99 e "R$ 22,6715" virava nulo.
+  function toNumTextoBR(v) {
+    if (typeof v === "number") return Number.isNaN(v) ? null : v;
+    if (v === null || v === undefined) return null;
+    const limpo = String(v).replace(/[^\d,.\-]/g, "");
+    if (!limpo) return null;
+    const n = parseBR(limpo);
+    return n === null || Number.isNaN(n) ? null : n;
   }
 
   function toNum(v, fallback) {
@@ -1343,9 +1360,9 @@ https://github.com/nodeca/pako/blob/main/LICENSE
           }
           resumoRows.push({
             codigo: String(r[1]).trim(),
-            qtde: toNum(r[2], null),
-            valorUnitario: toNum(r[3], null),
-            valorCalculado: toNum(r[4], null),
+            qtde: toNumTextoBR(r[2]),
+            valorUnitario: toNumTextoBR(r[3]),
+            valorCalculado: toNumTextoBR(r[4]),
           });
         }
       }
@@ -1555,6 +1572,14 @@ https://github.com/nodeca/pako/blob/main/LICENSE
           tarifaUnilog: idx["Tarifa que UNILOG aplicou"] !== undefined ? row[idx["Tarifa que UNILOG aplicou"]] : null,
         });
       }
+      // A planilha de conciliação consolidada pode trazer a tabela regressiva
+      // do B2C (por Nota Fiscal expedida/mês) numa aba própria, com o mesmo
+      // cabeçalho do Informativo oficial ("Escala | De | Até | Valor atual").
+      const { regressiva: regConciliacao } = parseUnilogReajusteOficial(wb);
+      if (regConciliacao.length) {
+        out.regressiva = regConciliacao;
+        warnings.push(`Planilha de tarifas: tabela regressiva por Nota Fiscal (B2C) lida de aba própria — ${regConciliacao.length} faixa(s).`);
+      }
       return out;
     }
     // Não é a planilha de conciliação da Sallve — tenta o formato oficial
@@ -1611,6 +1636,10 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     // plural (os sábados que a regra vale). Mesmo padrão provável para
     // domingo/feriado nas outras linhas de Hora Extra dessa mesma seção.
     sabados: "sabado", domingos: "domingo", feriados: "feriado",
+    // Fatura RJ set/26 (Kate, 19/10/2026): "[5] OPERAÇÃO B2C - UN EXCEDENTE
+    // [5 UN/PED]" × tabela "por unidade extra, após a 5ª unidade/pedido" —
+    // abreviações da fatura (un, ped) e sinônimo (excedente = extra).
+    un: "unidade", ped: "pedido", excedente: "extra", mkt: "marketing",
   };
 
   // Kate, 19/09/2026: mesmo caso de "H.E - SÁBADO" acima — a fatura escreve
@@ -1674,7 +1703,10 @@ https://github.com/nodeca/pako/blob/main/LICENSE
   function ehServicoPorNotaFiscalExpedida(codigo) {
     const n = normalizeText(codigo);
     const porNotaFiscalExpedida = n.includes("nota fiscal") && (n.includes("expedid") || n.includes("escala") || n.includes("regressiv"));
-    const b2cPorDocumento = n.includes("b2c") && n.includes("documento");
+    // "[6] OPERAÇÃO B2C - POR PEDIDO EXPEDIDO" (fatura SP set/26, Kate
+    // 19/10/2026) é o mesmo serviço que "POR DOCUMENTO" — o unitário vem da
+    // escala. Exclui "UN EXCEDENTE" (tarifa fixa por unidade extra).
+    const b2cPorDocumento = n.includes("b2c") && (n.includes("documento") || /por\s+pedido/.test(n)) && !/excedente|extra/.test(n);
     return porNotaFiscalExpedida || b2cPorDocumento;
   }
   function encontrarFaixaRegressivaUnilog(qtde, tiers) {
@@ -1696,7 +1728,9 @@ https://github.com/nodeca/pako/blob/main/LICENSE
       {
         title: "Tabela regressiva por Nota Fiscal expedida/mês (B2C)",
         fields: [
-          { key: "qtdeTotalNF3CDs", label: "Total de NF expedidas nos 3 CDs no mês (B2C)", default: 0, source: "Kate, 19/09/2026 — some o volume de NF expedidas do mês nos 3 CDs (BTC/SP/ES/RJ, conforme aplicável) para achar a faixa certa da tabela regressiva. A comparação do valor cobrado continua sendo feita só com os dados desta fatura." },
+          { key: "nfExpedidasSP", label: "NF expedidas no mês — SP (B2C)", default: 0, source: "Kate, 19/10/2026 — a faixa da tabela regressiva depende da SOMA de NF expedidas nos 3 CDs (SP + ES + RJ) no mês. Informe o volume de cada CD; o validador soma." },
+          { key: "nfExpedidasES", label: "NF expedidas no mês — ES (B2C)", default: 0, source: "Idem — volume de NF expedidas do CD ES no mês." },
+          { key: "nfExpedidasRJ", label: "NF expedidas no mês — RJ (B2C)", default: 0, source: "Idem — volume de NF expedidas do CD RJ no mês. O total (SP + ES + RJ) define a faixa; a comparação do valor cobrado continua sendo feita com os dados desta fatura." },
         ],
       },
       {
@@ -1748,11 +1782,11 @@ https://github.com/nodeca/pako/blob/main/LICENSE
       },
       {
         key: "tarifa",
-        label: "Planilha de tarifas (opcional)",
+        label: "Planilha de tarifas",
         accept: ".xlsx,.xls",
         multiple: false,
-        required: false,
-        desc: "Aceita dois formatos: a planilha de conciliação da Sallve (coluna 'Tarifa que UNILOG aplicou') OU o Informativo de Reajuste oficial da Unilog (planilha, não o PDF — ex.: aba 'Reajuste 2026'), reconhecido automaticamente. Usada só para checar consistência fatura x tarifa vigente (não é a negociação comercial).",
+        required: true,
+        desc: "Obrigatória. Use a tabela consolidada de tarifas Unilog (aba 'Tarifas consolidadas 2026', coluna 'Tarifa que UNILOG aplicou', + aba 'Escala B2C' com a tabela regressiva por NF) — também aceita o Informativo de Reajuste oficial da Unilog (planilha, não o PDF). A escala B2C usa a soma das NF expedidas nos 3 CDs (SP + ES + RJ), informada em Parâmetros.",
       },
     ],
 
@@ -1850,10 +1884,11 @@ https://github.com/nodeca/pako/blob/main/LICENSE
         // desta fatura sozinha (svc.qtde é só deste CD/depositante).
         const ehItemRegressiva = tarifaTable.regressiva && tarifaTable.regressiva.length && ehServicoPorNotaFiscalExpedida(svc.codigo);
         if (ehItemRegressiva) {
-          const qtdeTotal3CDs = params.qtdeTotalNF3CDs;
+          const nfSP = Number(params.nfExpedidasSP) || 0, nfES = Number(params.nfExpedidasES) || 0, nfRJ = Number(params.nfExpedidasRJ) || 0;
+          const qtdeTotal3CDs = nfSP + nfES + nfRJ;
           if (!qtdeTotal3CDs) {
             status = "REVISAO_MANUAL";
-            matchedDesc = `Tabela regressiva por Nota Fiscal expedida/mês — a faixa depende do volume TOTAL de NF dos 3 CDs, não só desta fatura. Informe o total em Parâmetros ("Total de NF expedidas nos 3 CDs no mês") para validar esta linha.`;
+            matchedDesc = `Tabela regressiva por Nota Fiscal expedida/mês — a faixa depende do volume TOTAL de NF dos 3 CDs, não só desta fatura. Informe em Parâmetros as NF expedidas no mês de cada CD (SP, ES e RJ) — o validador soma — para validar esta linha.`;
           } else {
             const faixaRegressiva = encontrarFaixaRegressivaUnilog(qtdeTotal3CDs, tarifaTable.regressiva);
             if (!faixaRegressiva) {
@@ -1861,9 +1896,9 @@ https://github.com/nodeca/pako/blob/main/LICENSE
               matchedDesc = `Tabela regressiva por Nota Fiscal expedida/mês — o total informado (${qtdeTotal3CDs} NF) não caiu em nenhuma faixa da tabela carregada.`;
             } else {
               tarifaEsperada = faixaRegressiva.valor;
-              matchedDesc = `Tabela regressiva por Nota Fiscal expedida/mês — faixa ${faixaRegressiva.de}–${faixaRegressiva.ate === Infinity ? "acima" : faixaRegressiva.ate} NF (tarifa ${fmtNumber(faixaRegressiva.valor)}/NF pelo volume TOTAL informado dos 3 CDs: ${qtdeTotal3CDs} NF)`;
+              matchedDesc = `Tabela regressiva por Nota Fiscal expedida/mês — faixa ${faixaRegressiva.de}–${faixaRegressiva.ate === Infinity ? "acima" : faixaRegressiva.ate} NF (tarifa ${fmtNumber(faixaRegressiva.valor)}/NF pelo volume TOTAL dos 3 CDs: SP ${nfSP} + ES ${nfES} + RJ ${nfRJ} = ${qtdeTotal3CDs} NF)`;
               desvioPct = tarifaEsperada > 0 ? (svc.valorUnitario - tarifaEsperada) / tarifaEsperada : 0;
-              status = Math.abs(desvioPct) > TOLERANCIA_PADRAO ? "DIVERGENTE" : "CORRETO";
+              status = Math.abs(desvioPct) > UNILOG_TOLERANCIA_UNITARIO ? "DIVERGENTE" : "CORRETO";
             }
           }
         } else if (!tarifaTable.length) {
@@ -1880,7 +1915,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
               status = "REVISAO_MANUAL";
             } else {
               desvioPct = tarifaEsperada > 0 ? (svc.valorUnitario - tarifaEsperada) / tarifaEsperada : 0;
-              status = Math.abs(desvioPct) > TOLERANCIA_PADRAO ? "DIVERGENTE" : "CORRETO";
+              status = Math.abs(desvioPct) > UNILOG_TOLERANCIA_UNITARIO ? "DIVERGENTE" : "CORRETO";
             }
           }
         }
