@@ -2194,13 +2194,15 @@ https://github.com/nodeca/pako/blob/main/LICENSE
   // tabela unificada (ex.: "PAC ES.xlsx" -> {servico:"PAC", cd:"ES"},
   // "SEDEX  RJ.xlsx" -> {servico:"SEDEX", cd:"RJ"} — tolera espaço duplo e
   // presença/ausência da extensão .xlsx).
+  // Aceita também o formato com nº de contrato na frente e a ordem invertida
+  // (ex.: "811493 RJ SEDEX.xlsx", "816195 SP PAC.xlsx") — procura o serviço
+  // (PAC/SEDEX) e o CD (ES/RJ/SP) em qualquer posição do texto.
   function parseCorreiosOrigemLabel(raw) {
-    const clean = String(raw || "").replace(/\.xlsx?$/i, "").trim();
-    const tokens = clean.split(/\s+/).filter(Boolean);
-    if (tokens.length < 2) return null;
-    const servico = tokens[0].toUpperCase();
-    const cd = tokens[tokens.length - 1].toUpperCase();
-    if (servico !== "PAC" && servico !== "SEDEX") return null;
+    const clean = String(raw || "").replace(/\.xlsx?$/i, "").trim().toUpperCase();
+    const tokens = clean.split(/[\s_\-]+/).filter(Boolean);
+    const servico = tokens.find((t) => t === "PAC" || t === "SEDEX");
+    const cd = tokens.find((t) => t === "ES" || t === "RJ" || t === "SP");
+    if (!servico || !cd) return null;
     return { servico, cd };
   }
 
@@ -2232,17 +2234,28 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     for (const block of blocks) {
       const label = parseCorreiosOrigemLabel(block.name);
       if (!label || block.rows.length < 4) continue; // bloco não reconhecido/curto demais — ignora
-      const header = block.rows[2]; // linha com CEPI/CEPF/faixas de peso
+      // linha com CEPI/CEPF/faixas de peso (normalmente a 3ª do bloco)
+      let headerIdx = block.rows.findIndex((r) => r && normalizeText(String(r[3] ?? "")) === normalizeText("CEPI"));
+      if (headerIdx < 0) headerIdx = 2;
+      const header = block.rows[headerIdx];
       if (!header) continue;
       let bracketEnd = 7;
       while (bracketEnd < header.length && Number.isFinite(Number(header[bracketEnd])) && header[bracketEnd] !== null && header[bracketEnd] !== "") {
         bracketEnd++;
       }
-      const weightCols = header.slice(7, bracketEnd).map((h) => Number(h));
+      // Faixas de peso em kg. Na tabela consolidada (Power Query) os
+      // cabeçalhos "0,500", "1,000"... chegam como 500, 1000... (vírgula
+      // lida como separador de milhar) — valor acima de 100 é tratado como
+      // gramas e convertido para kg.
+      const weightCols = header.slice(7, bracketEnd).map((h) => {
+        const n = Number(h);
+        return n > 100 ? n / 1000 : n;
+      });
       const excedenteIdx = bracketEnd;
       const pctNotaIdx = bracketEnd + 1;
       const table = [];
-      for (const r of block.rows.slice(3)) {
+      for (const r of block.rows.slice(headerIdx + 1)) {
+        if (!Number.isFinite(Number(r[3])) || !Number.isFinite(Number(r[4]))) continue;
         if (r[3] === null || r[4] === null || r[3] === undefined || r[4] === undefined) continue;
         table.push({
           cepi: Math.trunc(Number(r[3])),
@@ -2285,7 +2298,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
     const chavesEsperadas = ["PAC|ES", "PAC|RJ", "PAC|SP", "SEDEX|ES", "SEDEX|RJ", "SEDEX|SP"];
     const faltando = chavesEsperadas.filter((k) => !tarifaPorChave[k]);
     if (faltando.length) {
-      throw new Error(`Tabela de frete unificada dos Correios: não encontrei o(s) bloco(s) ${faltando.join(", ")} — confira se a coluna "Nome da Origem" segue o padrão "PAC <CD>" / "SEDEX <CD>" (ex.: "PAC ES", "SEDEX SP").`);
+      throw new Error(`Tabela de frete unificada dos Correios: não encontrei o(s) bloco(s) ${faltando.join(", ")} — confira se a coluna "Nome da Origem" traz o serviço (PAC/SEDEX) e o CD (ES/RJ/SP) — ex.: "PAC ES", "SEDEX SP" ou "811493 RJ SEDEX.xlsx".`);
     }
     return tarifaPorChave;
   }
@@ -2467,7 +2480,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
         accept: ".xlsx,.xls",
         multiple: false,
         required: true,
-        desc: "Um único arquivo com as 6 tabelas de tarifa por CEP e faixa de peso (PAC e SEDEX × Espírito Santo/Rio de Janeiro/São Paulo), empilhadas na mesma aba e identificadas pela coluna 'Nome da Origem' (ex.: 'PAC ES', 'SEDEX RJ').",
+        desc: "Um único arquivo com as 6 tabelas de tarifa por CEP e faixa de peso (PAC e SEDEX × Espírito Santo/Rio de Janeiro/São Paulo), empilhadas na mesma aba e identificadas pela coluna 'Nome da Origem' (ex.: 'PAC ES', 'SEDEX RJ' ou '811493 RJ SEDEX.xlsx').",
       },
     ],
 
